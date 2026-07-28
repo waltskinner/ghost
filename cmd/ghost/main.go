@@ -455,7 +455,9 @@ supersedes, causes, or neither).`)
 		os.Exit(1)
 	}
 
-	cls := supersede.NewHaikuClassifier(ai.NewClient(cfg.API.Key, logger))
+	primary := ai.NewAnthropicProvider(ai.NewClient(cfg.API.Key, logger))
+	provider := ai.NewFallbackProvider(primary, nil, false)
+	cls := supersede.NewHaikuClassifier(provider)
 	res, classified, err := supersede.Run(ctx, store, cls, projectID, threshold, apply, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -543,7 +545,9 @@ Marks resolved-evidence memories so they drop from session-start injection
 		os.Exit(1)
 	}
 
-	cls := resolve.NewHaikuClassifier(ai.NewClient(cfg.API.Key, logger))
+	primary := ai.NewAnthropicProvider(ai.NewClient(cfg.API.Key, logger))
+	provider := ai.NewFallbackProvider(primary, nil, false)
+	cls := resolve.NewHaikuClassifier(provider)
 	res, confirmed, err := resolve.Run(ctx, store, cls, projectID, apply, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

@@ -65,10 +65,12 @@ const (
 
 // Classifier decides the relationship between a newer and an older memory:
 // a same-fact replacement (SUPERSEDES), a decision citing supporting evidence
-// that stays valid (CAUSES), or neither. The LLM implementation lives in the
-// CLI layer; tests inject a deterministic mock.
+// that stays valid (CAUSES), or neither. It also reports whether the answer
+// came from a fallback provider (see ai.FallbackProvider) — callers use that
+// to withhold writes on a degraded-quality answer. The LLM implementation
+// lives in the CLI layer; tests inject a deterministic mock.
 type Classifier interface {
-	Classify(ctx context.Context, newer, older string) (Relation, error)
+	Classify(ctx context.Context, newer, older string) (relation Relation, fromFallback bool, err error)
 }
 
 // vectorStore is the subset of *memory.Store the pass needs; narrowed for
@@ -179,6 +181,12 @@ type Result struct {
 // same verdict for no reason. Fresh candidates are always classified
 // regardless, since SelectCandidates already bounds their cost.
 //
+// If any classification in the batch came from a fallback provider, apply is
+// skipped entirely for the whole batch (mirroring internal/resolve) — a
+// degraded-quality verdict should never silently write or invalidate a link;
+// the dry-run-style preview is still returned so callers can report what
+// would have happened.
+//
 // CreateLink and InvalidateLink are both idempotent no-ops when there's
 // nothing to change, so re-running Run converges and self-heals after
 // reflection's cascade-delete of links. A classifier error on one pair is
@@ -246,10 +254,14 @@ func Run(ctx context.Context, store vectorStore, cls Classifier, projectID strin
 
 	res := Result{Candidates: len(all)}
 	var classified []Classified
+	anyFallback := false
 	for _, c := range all {
-		verdict, err := cls.Classify(ctx, c.NewerContent, c.OlderContent)
+		verdict, fromFallback, err := cls.Classify(ctx, c.NewerContent, c.OlderContent)
 		if err != nil {
 			return res, nil, fmt.Errorf("classify %s→%s: %w", c.NewerID, c.OlderID, err)
+		}
+		if fromFallback {
+			anyFallback = true
 		}
 		classified = append(classified, Classified{Candidate: c, Relation: verdict})
 
@@ -265,36 +277,45 @@ func Run(ctx context.Context, store vectorStore, cls Classifier, projectID strin
 		if wasReclassify && verdict != RelationSupersedes {
 			res.Reclassified++
 		}
+	}
 
-		if !apply {
-			continue
-		}
-		switch verdict {
-		case RelationSupersedes:
-			if err := store.CreateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes), c.Similarity, "llm"); err != nil {
-				return res, nil, fmt.Errorf("create supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
-			}
-			res.Created++
-			if err := store.InvalidateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses)); err != nil {
-				return res, nil, fmt.Errorf("invalidate causes link %s→%s: %w", c.OlderID, c.NewerID, err)
-			}
-		case RelationCauses:
-			if err := store.CreateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses), c.Similarity, "llm"); err != nil {
-				return res, nil, fmt.Errorf("create causes link %s→%s: %w", c.OlderID, c.NewerID, err)
-			}
-			if err := store.InvalidateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes)); err != nil {
-				return res, nil, fmt.Errorf("invalidate supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
-			}
-		case RelationNeither:
-			if err := store.InvalidateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes)); err != nil {
-				return res, nil, fmt.Errorf("invalidate supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
-			}
-			if err := store.InvalidateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses)); err != nil {
-				return res, nil, fmt.Errorf("invalidate causes link %s→%s: %w", c.OlderID, c.NewerID, err)
-			}
-		}
+	if apply && anyFallback {
 		if logger != nil {
-			logger.Debug("supersede classified", "newer", c.NewerID, "older", c.OlderID, "verdict", verdict)
+			logger.Warn("supersede: candidates classified via fallback provider, apply skipped — rerun once primary is available",
+				"confirmed", res.Confirmed, "causes", res.CausesCreated)
+		}
+		return res, classified, nil
+	}
+
+	if apply {
+		for _, c := range classified {
+			switch c.Relation {
+			case RelationSupersedes:
+				if err := store.CreateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes), c.Similarity, "llm"); err != nil {
+					return res, nil, fmt.Errorf("create supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
+				}
+				res.Created++
+				if err := store.InvalidateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses)); err != nil {
+					return res, nil, fmt.Errorf("invalidate causes link %s→%s: %w", c.OlderID, c.NewerID, err)
+				}
+			case RelationCauses:
+				if err := store.CreateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses), c.Similarity, "llm"); err != nil {
+					return res, nil, fmt.Errorf("create causes link %s→%s: %w", c.OlderID, c.NewerID, err)
+				}
+				if err := store.InvalidateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes)); err != nil {
+					return res, nil, fmt.Errorf("invalidate supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
+				}
+			case RelationNeither:
+				if err := store.InvalidateLink(ctx, c.NewerID, c.OlderID, string(RelationSupersedes)); err != nil {
+					return res, nil, fmt.Errorf("invalidate supersedes link %s→%s: %w", c.NewerID, c.OlderID, err)
+				}
+				if err := store.InvalidateLink(ctx, c.OlderID, c.NewerID, string(RelationCauses)); err != nil {
+					return res, nil, fmt.Errorf("invalidate causes link %s→%s: %w", c.OlderID, c.NewerID, err)
+				}
+			}
+			if logger != nil {
+				logger.Debug("supersede classified", "newer", c.NewerID, "older", c.OlderID, "verdict", c.Relation)
+			}
 		}
 	}
 	return res, classified, nil
