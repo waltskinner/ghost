@@ -1248,7 +1248,7 @@ func TestStoreDecisions(t *testing.T) {
 	ctx := context.Background()
 
 	// Record a decision.
-	id, err := s.RecordDecision(ctx, testProject,
+	id, memID, err := s.RecordDecision(ctx, testProject,
 		"Use SQLite for storage",
 		"SQLite provides embedded persistence with FTS5",
 		"Simple, no external dependencies",
@@ -1260,6 +1260,9 @@ func TestStoreDecisions(t *testing.T) {
 	}
 	if id == "" {
 		t.Fatal("RecordDecision returned empty ID")
+	}
+	if memID == "" || memID == id {
+		t.Fatalf("RecordDecision returned invalid memory ID: %q (decision ID: %q)", memID, id)
 	}
 
 	// List decisions.
@@ -1328,7 +1331,7 @@ func TestRecordDecisionPersistsMemoryRow(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 
-	id, err := s.RecordDecision(ctx, testProject,
+	id, memID, err := s.RecordDecision(ctx, testProject,
 		"Use SQLite", "SQLite for persistence", "Simple and embedded",
 		[]string{"postgres"}, []string{"db"})
 	if err != nil {
@@ -1337,8 +1340,25 @@ func TestRecordDecisionPersistsMemoryRow(t *testing.T) {
 	if id == "" {
 		t.Fatal("expected non-empty decision ID")
 	}
+	if memID == "" || memID == id {
+		t.Fatalf("expected distinct non-empty memory ID, got %q (decision ID: %q)", memID, id)
+	}
 
-	// The memory row must exist — verify search finds it.
+	// The memory row must exist under memID — verify GetByIDs finds it
+	// directly, not just via a content search (that's the whole point of
+	// returning it).
+	mems, err := s.GetByIDs(ctx, []string{memID})
+	if err != nil {
+		t.Fatalf("GetByIDs(memID): %v", err)
+	}
+	if len(mems) != 1 {
+		t.Fatalf("GetByIDs(memID): got %d rows, want 1", len(mems))
+	}
+	if mems[0].Category != "decision" || !strings.Contains(mems[0].Content, "SQLite") {
+		t.Fatalf("memory row at memID has unexpected content: %+v", mems[0])
+	}
+
+	// Also verify search finds it (existing coverage, unchanged).
 	results, err := s.SearchFTS(ctx, testProject, "SQLite persistence", 10)
 	if err != nil {
 		t.Fatalf("SearchFTS: %v", err)
@@ -2236,5 +2256,83 @@ func assertActive(t *testing.T, s *Store, projectID, id string) {
 	}
 	if resolvedAt.Valid {
 		t.Errorf("memory %s should be active (resolved_at NULL), got %q", id, resolvedAt.String)
+	}
+}
+
+func TestGetTopMemoriesBackfillsAfterDemotion(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	a, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "alpha fact", Source: "manual", Importance: 0.9})
+	if err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	b, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "alpha fact restated", Source: "manual", Importance: 0.85})
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	c, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "distinct fact", Source: "manual", Importance: 0.8})
+	if err != nil {
+		t.Fatalf("create c: %v", err)
+	}
+
+	if err := s.CreateLink(ctx, a, b, "related", 0.95, "auto"); err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+
+	top, err := s.GetTopMemories(ctx, testProject, 2)
+	if err != nil {
+		t.Fatalf("GetTopMemories: %v", err)
+	}
+	if len(top) != 2 {
+		t.Fatalf("got %d results, want 2: %+v", len(top), top)
+	}
+	got := map[string]bool{top[0].ID: true, top[1].ID: true}
+	if !got[a] {
+		t.Errorf("expected higher-importance duplicate %q (a) to survive; got %+v", a, top)
+	}
+	if got[b] {
+		t.Errorf("expected lower-ranked duplicate %q (b) to be demoted; got %+v", b, top)
+	}
+	if !got[c] {
+		t.Errorf("expected backfill to include distinct memory %q (c); got %+v", c, top)
+	}
+}
+
+func TestSetDemotionThresholdOverridesDefault(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	a, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "alpha fact", Source: "manual", Importance: 0.9})
+	if err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	b, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "alpha fact restated", Source: "manual", Importance: 0.85})
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	c, err := s.Create(ctx, testProject, Memory{Category: "fact", Content: "distinct fact", Source: "manual", Importance: 0.8})
+	if err != nil {
+		t.Fatalf("create c: %v", err)
+	}
+
+	// Link strength (0.80) clears linking.threshold but sits below the
+	// default demotion threshold (0.90) — lowering the override to 0.75
+	// must make it demote.
+	if err := s.CreateLink(ctx, a, b, "related", 0.80, "auto"); err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	s.SetDemotionThreshold(0.75)
+
+	top, err := s.GetTopMemories(ctx, testProject, 2)
+	if err != nil {
+		t.Fatalf("GetTopMemories: %v", err)
+	}
+	got := map[string]bool{top[0].ID: true, top[1].ID: true}
+	if got[b] {
+		t.Errorf("lowered threshold should have demoted b; got %+v", top)
+	}
+	if !got[c] {
+		t.Errorf("expected backfill to include c; got %+v", top)
 	}
 }
