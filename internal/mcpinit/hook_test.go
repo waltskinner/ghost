@@ -3,6 +3,7 @@ package mcpinit
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,6 +239,61 @@ func TestSessionCounterIncrements(t *testing.T) {
 	}
 }
 
+// TestSessionCounterIgnoresResumeClearCompact: resume/clear/compact fire
+// SessionStart too, but a user perceives those as continuing the same
+// session — only "startup" (or an empty/legacy source) should bump the count.
+func TestSessionCounterIgnoresResumeClearCompact(t *testing.T) {
+	xdgHome := t.TempDir()
+	ghostDir := filepath.Join(xdgHome, "ghost")
+	if err := os.MkdirAll(ghostDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	dbPath := filepath.Join(ghostDir, "ghost.db")
+
+	projDir := filepath.Join(t.TempDir(), "myproj")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir proj: %v", err)
+	}
+	canonical, err := filepath.EvalSymlinks(projDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	db, err := memory.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects (id, path, name) VALUES ('p1', ?, 'myproj')`, canonical); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	_ = db.Close()
+
+	t.Setenv("XDG_DATA_HOME", xdgHome)
+
+	run := func(source string) string {
+		m := map[string]string{"cwd": projDir}
+		if source != "" {
+			m["source"] = source
+		}
+		input, _ := json.Marshal(m)
+		var out strings.Builder
+		HandleSessionStartHook(strings.NewReader(string(input)), &out)
+		return out.String()
+	}
+
+	if got := run("startup"); !strings.Contains(got, "Session #1") {
+		t.Errorf("startup should show Session #1; got:\n%s", got)
+	}
+	for _, source := range []string{"resume", "clear", "compact"} {
+		if got := run(source); !strings.Contains(got, "Session #1") {
+			t.Errorf("%s should NOT bump the counter, still Session #1; got:\n%s", source, got)
+		}
+	}
+	if got := run("startup"); !strings.Contains(got, "Session #2") {
+		t.Errorf("second startup should show Session #2; got:\n%s", got)
+	}
+}
+
 // TestBumpSessionCountNoPhantomDB: the counter write path must never create a
 // database that isn't there.
 func TestBumpSessionCountNoPhantomDB(t *testing.T) {
@@ -300,5 +356,90 @@ func TestInjectionExcludesResolved(t *testing.T) {
 	}
 	if strings.Contains(result, "RESOLVEDMARKER") {
 		t.Errorf("resolved memory must not be injected; got:\n%s", result)
+	}
+}
+
+// TestSessionInjectionBackfillsAfterDemotion: a near-duplicate pair linked
+// above the demotion threshold must not both occupy injection slots — the
+// backfill (LIMIT 50 over-fetch) must surface a distinct memory instead.
+func TestSessionInjectionBackfillsAfterDemotion(t *testing.T) {
+	xdgHome := t.TempDir()
+	ghostDir := filepath.Join(xdgHome, "ghost")
+	if err := os.MkdirAll(ghostDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	dbPath := filepath.Join(ghostDir, "ghost.db")
+
+	projDir := filepath.Join(t.TempDir(), "myproj")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir proj: %v", err)
+	}
+	canonical, err := filepath.EvalSymlinks(projDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	db, err := memory.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects (id, path, name) VALUES ('p1', ?, 'myproj')`, canonical); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	// Two near-duplicates (a, b) plus 23 filler memories plus a distinct
+	// memory (c). loadSessionContext over-fetches LIMIT 50 then truncates to
+	// 25; with only 3 memories total the >25 demotion gate could never fire,
+	// so this fixture pads the candidate set past 25 (26 total) so the gate
+	// fires and truncation actually drops the demoted duplicate, letting the
+	// distinct memory (ranked last, just past the naive top-25 cut) backfill
+	// into the surviving slot instead. Importance ordering: a > b > fillers > c.
+	if _, err := db.Exec(
+		`INSERT INTO memories (id, project_id, category, content, source, importance) VALUES ('aaaa0001', 'p1', 'fact', 'ALPHAMARKER original', 'manual', 0.99)`,
+	); err != nil {
+		t.Fatalf("insert a: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO memories (id, project_id, category, content, source, importance) VALUES ('bbbb0001', 'p1', 'fact', 'ALPHAMARKER restated', 'manual', 0.98)`,
+	); err != nil {
+		t.Fatalf("insert b: %v", err)
+	}
+	for i := 0; i < 23; i++ {
+		fillerID := fmt.Sprintf("filler%02d", i)
+		importance := 0.97 - float64(i)*0.01
+		if _, err := db.Exec(
+			`INSERT INTO memories (id, project_id, category, content, source, importance) VALUES (?, 'p1', 'fact', ?, 'manual', ?)`,
+			fillerID, fmt.Sprintf("FILLER%02d unrelated filler content", i), importance,
+		); err != nil {
+			t.Fatalf("insert filler %d: %v", i, err)
+		}
+	}
+	if _, err := db.Exec(
+		`INSERT INTO memories (id, project_id, category, content, source, importance) VALUES ('cccc0001', 'p1', 'fact', 'DISTINCTMARKER unrelated', 'manual', 0.10)`,
+	); err != nil {
+		t.Fatalf("insert c: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO memory_links (source_id, target_id, relation, strength, source) VALUES ('aaaa0001', 'bbbb0001', 'related', 0.95, 'auto')`,
+	); err != nil {
+		t.Fatalf("insert link: %v", err)
+	}
+	_ = db.Close()
+
+	t.Setenv("XDG_DATA_HOME", xdgHome)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	input, _ := json.Marshal(map[string]string{"cwd": projDir})
+	var out strings.Builder
+	HandleSessionStartHook(strings.NewReader(string(input)), &out)
+	result := out.String()
+
+	if !strings.Contains(result, "ALPHAMARKER original") {
+		t.Errorf("higher-ranked duplicate must survive; got:\n%s", result)
+	}
+	if strings.Contains(result, "ALPHAMARKER restated") {
+		t.Errorf("lower-ranked duplicate must be demoted out; got:\n%s", result)
+	}
+	if !strings.Contains(result, "DISTINCTMARKER") {
+		t.Errorf("backfill must surface the distinct memory; got:\n%s", result)
 	}
 }
