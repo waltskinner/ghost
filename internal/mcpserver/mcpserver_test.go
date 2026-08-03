@@ -32,60 +32,119 @@ func testStore(t *testing.T) *memory.Store {
 	return s
 }
 
-func TestResolveProjectID_ByName(t *testing.T) {
+func TestResolveProject_ByName(t *testing.T) {
 	store := testStore(t)
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	srv := &Server{store: store, logger: logger}
-
 	ctx := context.Background()
-	got := srv.resolveProjectID(ctx, "test-project")
-	if got != "abc123" {
-		t.Errorf("resolveProjectID(name) = %q, want %q", got, "abc123")
+	id, name, err := store.ResolveProject(ctx, "test-project")
+	if err != nil {
+		t.Fatalf("ResolveProject(name): %v", err)
+	}
+	if id != "abc123" || name != "test-project" {
+		t.Errorf("ResolveProject(name) = (%q, %q), want (%q, %q)", id, name, "abc123", "test-project")
 	}
 }
 
-func TestResolveProjectID_ByID(t *testing.T) {
+func TestResolveProject_ByID(t *testing.T) {
 	store := testStore(t)
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	srv := &Server{store: store, logger: logger}
-
 	ctx := context.Background()
-	got := srv.resolveProjectID(ctx, "abc123")
-	if got != "abc123" {
-		t.Errorf("resolveProjectID(id) = %q, want %q", got, "abc123")
+	id, name, err := store.ResolveProject(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("ResolveProject(id): %v", err)
+	}
+	if id != "abc123" || name != "test-project" {
+		t.Errorf("ResolveProject(id) = (%q, %q), want (%q, %q)", id, name, "abc123", "test-project")
 	}
 }
 
-func TestResolveProjectID_Unknown(t *testing.T) {
+func TestResolveProject_Unknown(t *testing.T) {
 	store := testStore(t)
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	srv := &Server{store: store, logger: logger}
-
 	ctx := context.Background()
-	got := srv.resolveProjectID(ctx, "nonexistent")
-	// Should fall through and return the input as-is.
-	if got != "nonexistent" {
-		t.Errorf("resolveProjectID(unknown) = %q, want %q", got, "nonexistent")
+	id, name, err := store.ResolveProject(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("ResolveProject(unknown): %v", err)
+	}
+	// No match should return empty id/name rather than echoing the input.
+	if id != "" || name != "" {
+		t.Errorf("ResolveProject(unknown) = (%q, %q), want (\"\", \"\")", id, name)
 	}
 }
 
-func TestResolveProjectID_NameTakesPrecedence(t *testing.T) {
+func TestResolveProject_IDTakesPrecedenceOverName(t *testing.T) {
 	store := testStore(t)
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-
-	// Create a second project where the name matches the first project's ID.
 	ctx := context.Background()
+
+	// Create a second project whose name matches the first project's ID.
 	if err := store.EnsureProject(ctx, "def456", "/tmp/second", "abc123"); err != nil {
 		t.Fatalf("EnsureProject second: %v", err)
 	}
 
-	srv := &Server{store: store, logger: logger}
+	// When "abc123" is passed, ID lookup should match the first project's ID
+	// directly rather than falling through to a name match.
+	id, name, err := store.ResolveProject(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("ResolveProject: %v", err)
+	}
+	if id != "abc123" || name != "test-project" {
+		t.Errorf("ResolveProject should prefer ID lookup, got (%q, %q), want (%q, %q)", id, name, "abc123", "test-project")
+	}
+}
 
-	// When "abc123" is passed, name lookup should match the second project's name.
-	got := srv.resolveProjectID(ctx, "abc123")
-	// Name "abc123" maps to project ID "def456".
-	if got != "def456" {
-		t.Errorf("resolveProjectID should prefer name lookup, got %q, want %q", got, "def456")
+func TestGhostTaskCreate_RejectsUnknownProject(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+	session := connectedClient(t, srv)
+
+	ctx := context.Background()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_task_create",
+		Arguments: map[string]any{"project_id": "nonexistent-project", "title": "should not be created"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ghost_task_create: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error result for unknown project, got: %+v", result.Content)
+	}
+
+	tasks, err := store.ListTasks(ctx, "", "", 10)
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("task must not be persisted against an empty project id, found %d", len(tasks))
+	}
+}
+
+func TestGhostDecisionRecord_RejectsUnknownProject(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+	session := connectedClient(t, srv)
+
+	ctx := context.Background()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "ghost_decision_record",
+		Arguments: map[string]any{
+			"project_id": "nonexistent-project",
+			"title":      "should not be recorded",
+			"decision":   "some decision",
+			"rationale":  "some rationale",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ghost_decision_record: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error result for unknown project, got: %+v", result.Content)
+	}
+
+	decisions, err := store.ListDecisions(ctx, "", "", 10)
+	if err != nil {
+		t.Fatalf("ListDecisions: %v", err)
+	}
+	if len(decisions) != 0 {
+		t.Errorf("decision must not be persisted against an empty project id, found %d", len(decisions))
 	}
 }
 
