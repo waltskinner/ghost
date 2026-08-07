@@ -2,6 +2,7 @@ package mcpinit
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,6 +69,25 @@ func writeStubGhost(t *testing.T) string {
 		t.Fatalf("write stub ghost: %v", err)
 	}
 	return binDir
+}
+
+// writeGhostConfigFile writes a ghost config.yaml into the isolated config dir
+// (os.UserConfigDir under the test's HOME) and returns its path.
+func writeGhostConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("user config dir: %v", err)
+	}
+	dir := filepath.Join(configDir, "ghost")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir ghost config dir: %v", err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write ghost config: %v", err)
+	}
+	return path
 }
 
 // writeOpencodeConfigFile writes an opencode config file into the given
@@ -182,8 +202,13 @@ func TestStatusOpencode_EmptyStoreHealthy(t *testing.T) {
 	defer ollama.Close()
 
 	statusEnv(t)
+	writeGhostConfigFile(t, fmt.Sprintf(`embedding:
+  ollama_url: %s
+  model: nomic-embed-text:v1.5
+  dimensions: 768
+  enabled: true
+`, ollama.URL))
 	t.Setenv("GHOST_EMBEDDING_ENABLED", "true")
-	t.Setenv("GHOST_EMBEDDING_OLLAMA_URL", ollama.URL)
 	t.Setenv("PATH", writeStubGhost(t))
 
 	ghostDir := filepath.Join(os.Getenv("XDG_DATA_HOME"), "ghost")
