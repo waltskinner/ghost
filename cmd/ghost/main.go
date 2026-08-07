@@ -119,10 +119,37 @@ func runMCP() {
 	}
 }
 
-// runMCPInit configures Claude Code to use Ghost as its memory system.
+// runMCPInit configures an MCP client to use Ghost as its memory system.
+// Defaults to Claude Code; --client opencode targets opencode instead.
 func runMCPInit() {
-	dryRun := len(os.Args) > 3 && os.Args[3] == "--dry-run"
-	if err := mcpinit.Run(os.Stdout, dryRun); err != nil {
+	var client string
+	dryRun := false
+	for i := 3; i < len(os.Args); i++ {
+		switch {
+		case os.Args[i] == "--dry-run":
+			dryRun = true
+		case os.Args[i] == "--client" && i+1 < len(os.Args):
+			client = os.Args[i+1]
+			i++
+		case strings.HasPrefix(os.Args[i], "--client="):
+			client = strings.TrimPrefix(os.Args[i], "--client=")
+		}
+	}
+	if client == "" {
+		client = "claude"
+	}
+
+	var err error
+	switch client {
+	case "opencode":
+		err = mcpinit.RunOpencode(os.Stdout, dryRun)
+	case "claude":
+		err = mcpinit.Run(os.Stdout, dryRun)
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown client %q (expected claude or opencode)\n", client)
+		os.Exit(1)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

@@ -25,7 +25,7 @@ func Run(w io.Writer, dryRun bool) error {
 
 	// Step 1: Prerequisites.
 	_, _ = fmt.Fprintln(w, "[1/8] Checking prerequisites...")
-	ghostBin, claudeBin, err := checkPrereqs(w)
+	ghostBin, claudeBin, err := checkPrereqs(w, "claude")
 	if err != nil {
 		return retryHint(err)
 	}
@@ -94,21 +94,52 @@ func retryHint(err error) error {
 	return fmt.Errorf("%w\n  Re-run `ghost mcp init` to retry", err)
 }
 
-// checkPrereqs verifies that both ghost and claude binaries are on PATH.
-func checkPrereqs(w io.Writer) (ghostBin, claudeBin string, err error) {
-	ghostBin, err = exec.LookPath("ghost")
-	if err != nil {
+// checkPrereqs verifies the binaries required for the given client target.
+// The "claude" target requires both ghost and claude; the "opencode" target
+// requires only ghost.
+func checkPrereqs(w io.Writer, client string) (ghostBin, claudeBin string, err error) {
+	ghostBin = findBinary("ghost")
+	if ghostBin == "" {
 		return "", "", fmt.Errorf("ghost binary not found in PATH — install it first")
 	}
 	_, _ = fmt.Fprintf(w, "  ✓ ghost binary at %s\n", ghostBin)
 
-	claudeBin, err = exec.LookPath("claude")
-	if err != nil {
-		return "", "", fmt.Errorf("claude CLI not found in PATH — install Claude Code first")
+	if client == "claude" {
+		claudeBin = findBinary("claude")
+		if claudeBin == "" {
+			return "", "", fmt.Errorf("claude CLI not found in PATH — install Claude Code first")
+		}
+		_, _ = fmt.Fprintf(w, "  ✓ claude CLI at %s\n", claudeBin)
 	}
-	_, _ = fmt.Fprintf(w, "  ✓ claude CLI at %s\n", claudeBin)
 
 	return ghostBin, claudeBin, nil
+}
+
+// findBinary locates name on PATH first, then falls back to common install
+// directories that are typically not on PATH (e.g. ~/.local/bin for the claude
+// native installer, ~/go/bin for go install). The probe dirs are derived from
+// the effective home dir so tests that set HOME stay isolated from host
+// binaries.
+func findBinary(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	for _, dir := range []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "go", "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+	} {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode().Perm()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
 }
 
 // registerMCP ensures the ghost MCP server is registered with claude.

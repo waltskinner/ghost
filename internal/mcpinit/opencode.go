@@ -1,0 +1,304 @@
+package mcpinit
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/wcatz/ghost/internal/config"
+	"github.com/wcatz/ghost/internal/embedding"
+)
+
+// RunOpencode registers Ghost as an MCP server for opencode by merging the
+// mcp.ghost entry into opencode's config file, then verifies the local Ollama
+// embedding model. Unlike Run, it never touches Claude Code's settings and
+// only requires the ghost binary.
+func RunOpencode(w io.Writer, dryRun bool) error {
+	if dryRun {
+		_, _ = fmt.Fprintf(w, "\nDry run — showing what would change:\n\n")
+	}
+
+	// Step 1: Prerequisites — only the ghost binary is required.
+	_, _ = fmt.Fprintln(w, "[1/2] Checking prerequisites...")
+	if _, _, err := checkPrereqs(w, "opencode"); err != nil {
+		return retryHint(err)
+	}
+
+	// Step 2: MCP server registration.
+	_, _ = fmt.Fprintln(w, "\n[2/2] Registering MCP server...")
+	changed, err := registerOpencodeMCP(w, dryRun)
+	if err != nil {
+		return retryHint(err)
+	}
+
+	if changed && !dryRun {
+		_, _ = fmt.Fprintln(w, "Restart opencode to activate.")
+		verifyOpencodeRegistration(w)
+	}
+
+	// Step 3: Ollama embedding model.
+	if err := checkOllama(w); err != nil {
+		_, _ = fmt.Fprintf(w, "  ! %v\n", err)
+	}
+
+	if dryRun {
+		_, _ = fmt.Fprintln(w, "\nNo changes made (dry run).")
+	}
+	return nil
+}
+
+// registerOpencodeMCP deep-merges the ghost MCP server entry into opencode's
+// config, preserving all other keys. It returns true when the config was
+// (or would be, for a dry run) written.
+func registerOpencodeMCP(w io.Writer, dryRun bool) (bool, error) {
+	path, err := opencodeConfigPath()
+	if err != nil {
+		return false, err
+	}
+
+	cfg, err := loadOpencodeConfig(path)
+	if err != nil {
+		return false, err
+	}
+
+	if mcpGhostAlreadyRegistered(cfg) {
+		_, _ = fmt.Fprintln(w, "  ✓ ghost MCP server already registered")
+		return false, nil
+	}
+
+	if dryRun {
+		_, _ = fmt.Fprintln(w, "  ~ would register ghost MCP server for opencode")
+		return true, nil
+	}
+
+	setMCPGhost(cfg)
+	if err := writeOpencodeConfig(path, cfg); err != nil {
+		return false, err
+	}
+	_, _ = fmt.Fprintln(w, "  + registered ghost MCP server for opencode")
+	return true, nil
+}
+
+// verifyOpencodeRegistration checks via `opencode mcp ls` that the ghost entry
+// took effect. When the opencode CLI is absent, it points at the manual config
+// route; the config-file merge has already done the work either way.
+func verifyOpencodeRegistration(w io.Writer) {
+	ocBin, err := exec.LookPath("opencode")
+	if err != nil {
+		_, _ = fmt.Fprintln(w, "opencode CLI not found in PATH — manual config route: add {\"mcp\":{\"ghost\":{\"type\":\"local\",\"command\":[\"ghost\",\"mcp\"],\"enabled\":true}}} to the opencode config")
+		return
+	}
+	out, err := exec.Command(ocBin, "mcp", "ls").CombinedOutput()
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "  ! could not verify registration (`opencode mcp ls` failed): %s\n", strings.TrimSpace(string(out)))
+		return
+	}
+	if strings.Contains(string(out), "ghost") {
+		_, _ = fmt.Fprintln(w, "  ✓ verified: ghost listed by `opencode mcp ls`")
+	} else {
+		_, _ = fmt.Fprintln(w, "  ! `opencode mcp ls` succeeded but ghost is not listed — check the config manually")
+	}
+}
+
+// mcpGhostAlreadyRegistered reports whether the config already has an mcp.ghost
+// entry with command ["ghost","mcp"].
+func mcpGhostAlreadyRegistered(cfg map[string]any) bool {
+	mcp, ok := cfg["mcp"].(map[string]any)
+	if !ok {
+		return false
+	}
+	ghost, ok := mcp["ghost"].(map[string]any)
+	if !ok {
+		return false
+	}
+	cmd, ok := ghost["command"].([]any)
+	if !ok || len(cmd) != 2 {
+		return false
+	}
+	return cmd[0] == "ghost" && cmd[1] == "mcp"
+}
+
+// setMCPGhost deep-merges the ghost MCP server entry into the config.
+func setMCPGhost(cfg map[string]any) {
+	mcp, ok := cfg["mcp"].(map[string]any)
+	if !ok {
+		mcp = make(map[string]any)
+		cfg["mcp"] = mcp
+	}
+	mcp["ghost"] = map[string]any{
+		"type":    "local",
+		"command": []string{"ghost", "mcp"},
+		"enabled": true,
+	}
+}
+
+// opencodeConfigPath resolves the opencode config file: opencode.jsonc when it
+// already exists (opencode prefers it and loading both is undefined), else
+// opencode.json.
+func opencodeConfigPath() (string, error) {
+	dir, err := opencodeConfigDir()
+	if err != nil {
+		return "", err
+	}
+	jsonc := filepath.Join(dir, "opencode", "opencode.jsonc")
+	if _, err := os.Stat(jsonc); err == nil {
+		return jsonc, nil
+	}
+	return filepath.Join(dir, "opencode", "opencode.json"), nil
+}
+
+// opencodeConfigDir returns $XDG_CONFIG_HOME when set, else ~/.config.
+func opencodeConfigDir() (string, error) {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return xdg, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	return filepath.Join(home, ".config"), nil
+}
+
+// loadOpencodeConfig reads and parses the config file, tolerating // line
+// comments in .jsonc files. A missing or empty file yields an empty config.
+func loadOpencodeConfig(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return make(map[string]any), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return make(map[string]any), nil
+	}
+	if strings.HasSuffix(path, ".jsonc") {
+		data = stripJSONCComments(data)
+	}
+	cfg := make(map[string]any)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if cfg == nil {
+		cfg = make(map[string]any)
+	}
+	return cfg, nil
+}
+
+// stripJSONCComments removes // line comments from JSONC content while leaving
+// string contents (and URLs) intact.
+func stripJSONCComments(data []byte) []byte {
+	var out []byte
+	inStr := false
+	escaped := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inStr {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+			out = append(out, c)
+		case '/':
+			if i+1 < len(data) && data[i+1] == '/' {
+				for i < len(data) && data[i] != '\n' {
+					i++
+				}
+				if i < len(data) {
+					out = append(out, '\n')
+				}
+			} else {
+				out = append(out, c)
+			}
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// writeOpencodeConfig writes the config atomically: temp file + rename in the
+// target directory, after creating it if needed.
+func writeOpencodeConfig(path string, cfg map[string]any) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create dir %s: %w", dir, err)
+	}
+
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal opencode config: %w", err)
+	}
+	out = append(out, '\n')
+
+	tmp, err := os.CreateTemp(dir, ".opencode-*.json")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	return nil
+}
+
+// checkOllama verifies the configured embedding model is installed, mirroring
+// the health check in Status. It only inspects — no writes.
+func checkOllama(w io.Writer) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if !cfg.Embedding.Enabled {
+		_, _ = fmt.Fprintln(w, "  - embedding disabled in config (FTS-only search)")
+		return nil
+	}
+	client := embedding.NewClient(cfg.Embedding.OllamaURL, cfg.Embedding.Model, cfg.Embedding.Dimensions)
+	ctx := context.Background()
+	if !client.Alive(ctx) {
+		_, _ = fmt.Fprintf(w, "  ✗ Ollama unreachable at %s — embeddings paused\n", cfg.Embedding.OllamaURL)
+		return nil
+	}
+	present, err := client.HasModel(ctx)
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "  ! Ollama check failed: %v\n", err)
+		return nil
+	}
+	if present {
+		_, _ = fmt.Fprintf(w, "  ✓ Ollama model %s installed\n", cfg.Embedding.Model)
+	} else {
+		_, _ = fmt.Fprintf(w, "  ✗ Ollama model %s missing — run: ollama pull %s\n", cfg.Embedding.Model, cfg.Embedding.Model)
+	}
+	return nil
+}
