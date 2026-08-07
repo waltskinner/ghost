@@ -155,9 +155,34 @@ func runMCPInit() {
 	}
 }
 
-// runMCPStatus checks the health of the Ghost ↔ Claude Code integration.
+// runMCPStatus checks the health of the Ghost ↔ MCP client integration.
+// Defaults to Claude Code; --client opencode reports opencode-specific checks.
 func runMCPStatus() {
-	if err := mcpinit.Status(os.Stdout); err != nil {
+	var client string
+	for i := 3; i < len(os.Args); i++ {
+		switch {
+		case os.Args[i] == "--client" && i+1 < len(os.Args):
+			client = os.Args[i+1]
+			i++
+		case strings.HasPrefix(os.Args[i], "--client="):
+			client = strings.TrimPrefix(os.Args[i], "--client=")
+		}
+	}
+	if client == "" {
+		client = "claude"
+	}
+
+	var err error
+	switch client {
+	case "opencode":
+		err = mcpinit.StatusOpencode(os.Stdout)
+	case "claude":
+		err = mcpinit.Status(os.Stdout)
+	default:
+		fmt.Fprintf(os.Stderr, "error: unknown client %q (expected claude or opencode)\n", client)
+		os.Exit(1)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -887,8 +912,8 @@ Usage:
 
 Commands:
   mcp                         Start MCP server on stdio (used by Claude Code)
-  mcp init [--dry-run]        Configure Claude Code integration
-  mcp status                  Check Claude Code integration health
+  mcp init [--client claude|opencode] [--dry-run]  Configure MCP client integration
+  mcp status [--client claude|opencode]            Check MCP client integration health
   reflect <project> [flags]   Memory consolidation (dry-run by default, --apply to save)
   supersede <project> [flags] Link superseded memories (dry-run by default, --apply to write)
   resolve <project> [flags]   Mark resolved evidence memories (dry-run by default, --apply to write)

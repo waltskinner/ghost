@@ -31,14 +31,14 @@ func Status(w io.Writer) error {
 	}
 
 	// 1. Ghost binary.
-	ghostBin, err := exec.LookPath("ghost")
-	check(err == nil,
+	ghostBin := findBinary("ghost")
+	check(ghostBin != "",
 		fmt.Sprintf("ghost binary: %s", ghostBin),
 		"ghost binary not found in PATH")
 
 	// 2. Claude CLI.
-	claudeBin, err := exec.LookPath("claude")
-	check(err == nil,
+	claudeBin := findBinary("claude")
+	check(claudeBin != "",
 		fmt.Sprintf("claude CLI: %s", claudeBin),
 		"claude CLI not found in PATH")
 
@@ -138,9 +138,7 @@ func Status(w io.Writer) error {
 								fmt.Sprintf("Ollama model %s missing — run: ollama pull %s", cfg.Embedding.Model, cfg.Embedding.Model))
 						}
 						if embedded, total, sErr := store.EmbeddingStats(ctx); sErr == nil {
-							check(total == 0 || embedded > 0,
-								fmt.Sprintf("embeddings: %d/%d memories", embedded, total),
-								fmt.Sprintf("embeddings: %d/%d memories — vector search and linking inactive", embedded, total))
+							checkEmbeddingStats(check, embedded, total)
 						}
 						if links, scans, lErr := store.LinkStats(ctx); lErr == nil {
 							_, _ = fmt.Fprintf(w, "  - memory links: %d links, %d memories scanned\n", links, scans)
@@ -160,4 +158,105 @@ func Status(w io.Writer) error {
 		_, _ = fmt.Fprintln(w, "Run `ghost mcp init` to fix issues.")
 	}
 	return nil
+}
+
+// StatusOpencode checks the health of the Ghost ↔ opencode integration.
+// Unlike Status, it reports only opencode-relevant checks — the ghost binary,
+// the mcp.ghost entry in the opencode config, Ollama, and the client-agnostic
+// embedding/link stats. Claude-only checks (hooks, permissions, autoMemory,
+// redirects) are never reported here, so a clean opencode setup prints
+// "All checks passed." without the Claude CLI installed.
+func StatusOpencode(w io.Writer) error {
+	_, _ = fmt.Fprintf(w, "\nGhost ↔ opencode integration status:\n\n")
+
+	healthy := true
+	check := func(ok bool, pass, fail string) {
+		if ok {
+			_, _ = fmt.Fprintf(w, "  ✓ %s\n", pass)
+		} else {
+			_, _ = fmt.Fprintf(w, "  ✗ %s\n", fail)
+			healthy = false
+		}
+	}
+
+	// 1. Ghost binary.
+	ghostBin := findBinary("ghost")
+	check(ghostBin != "",
+		fmt.Sprintf("ghost binary: %s", ghostBin),
+		"ghost binary not found in PATH")
+
+	// 2. opencode MCP config.
+	path, err := opencodeConfigPath()
+	if err != nil {
+		check(false, "", fmt.Sprintf("opencode MCP config: %v", err))
+	} else if cfg, err := loadOpencodeConfig(path); err != nil {
+		check(false, "", fmt.Sprintf("opencode MCP config: %v", err))
+	} else {
+		check(mcpGhostAlreadyRegistered(cfg),
+			"opencode MCP config: ghost registered",
+			"opencode MCP config: ghost missing or wrong command")
+	}
+
+	// 3. Embedding & linking health — silent embed failures leave vector
+	// search and memory linking inactive.
+	dataDir, err := config.DataDir()
+	if err == nil {
+		dbPath := filepath.Join(dataDir, "ghost.db")
+		if _, err := os.Stat(dbPath); err == nil {
+			db, err := memory.OpenDB(dbPath)
+			if err != nil {
+				check(false, "", fmt.Sprintf("database: %v", err))
+			} else {
+				defer db.Close() //nolint:errcheck
+				logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+				store := memory.NewStore(db, logger)
+				ctx := context.Background()
+				if cfg, cfgErr := config.Load(); cfgErr == nil {
+					if !cfg.Embedding.Enabled {
+						_, _ = fmt.Fprintln(w, "  - embedding disabled in config (FTS-only search)")
+					} else {
+						client := embedding.NewClient(cfg.Embedding.OllamaURL, cfg.Embedding.Model, cfg.Embedding.Dimensions)
+						if !client.Alive(ctx) {
+							check(false, "", fmt.Sprintf("Ollama unreachable at %s — embeddings paused", cfg.Embedding.OllamaURL))
+						} else {
+							present, mErr := client.HasModel(ctx)
+							check(mErr == nil && present,
+								fmt.Sprintf("Ollama model %s installed", cfg.Embedding.Model),
+								fmt.Sprintf("Ollama model %s missing — run: ollama pull %s", cfg.Embedding.Model, cfg.Embedding.Model))
+						}
+						if embedded, total, sErr := store.EmbeddingStats(ctx); sErr == nil {
+							checkEmbeddingStats(check, embedded, total)
+						}
+						if links, scans, lErr := store.LinkStats(ctx); lErr == nil {
+							_, _ = fmt.Fprintf(w, "  - memory links: %d links, %d memories scanned\n", links, scans)
+						}
+					}
+				}
+			}
+		} else {
+			_, _ = fmt.Fprintln(w, "  - no Ghost database (run ghost first)")
+		}
+	}
+
+	_, _ = fmt.Fprintln(w)
+	if healthy {
+		_, _ = fmt.Fprintln(w, "All checks passed.")
+	} else {
+		_, _ = fmt.Fprintln(w, "Run `ghost mcp init --client opencode` to fix issues.")
+	}
+	return nil
+}
+
+// checkEmbeddingStats reports embedding coverage via the check closure. An
+// empty store is healthy — total == 0 passes with "(store empty)"; only a
+// non-empty store with no embedded memories means vector search and linking
+// are inactive. Shared by Status and StatusOpencode.
+func checkEmbeddingStats(check func(ok bool, pass, fail string), embedded, total int) {
+	if total == 0 {
+		check(true, "embeddings: 0 memories (store empty)", "")
+		return
+	}
+	check(embedded > 0,
+		fmt.Sprintf("embeddings: %d/%d memories", embedded, total),
+		fmt.Sprintf("embeddings: %d/%d memories — vector search and linking inactive", embedded, total))
 }
