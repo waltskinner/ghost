@@ -2,7 +2,6 @@ package mcpinit
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/wcatz/ghost/internal/config"
-	"github.com/wcatz/ghost/internal/embedding"
 )
 
 // RunOpencode registers Ghost as an MCP server for opencode by merging the
@@ -43,8 +41,17 @@ func RunOpencode(w io.Writer, dryRun bool) error {
 	}
 
 	// Step 3: Ollama embedding model.
-	if err := checkOllama(w); err != nil {
-		_, _ = fmt.Fprintf(w, "  ! %v\n", err)
+	cfg, err := config.Load()
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "  ! load config: %v\n", err)
+	} else {
+		checkOllama(w, cfg, func(ok bool, pass, fail string) {
+			if ok {
+				_, _ = fmt.Fprintf(w, "  ✓ %s\n", pass)
+			} else {
+				_, _ = fmt.Fprintf(w, "  ✗ %s\n", fail)
+			}
+		})
 	}
 
 	if dryRun {
@@ -269,36 +276,6 @@ func writeOpencodeConfig(path string, cfg map[string]any) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp file: %w", err)
-	}
-	return nil
-}
-
-// checkOllama verifies the configured embedding model is installed, mirroring
-// the health check in Status. It only inspects — no writes.
-func checkOllama(w io.Writer) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-	if !cfg.Embedding.Enabled {
-		_, _ = fmt.Fprintln(w, "  - embedding disabled in config (FTS-only search)")
-		return nil
-	}
-	client := embedding.NewClient(cfg.Embedding.OllamaURL, cfg.Embedding.Model, cfg.Embedding.Dimensions)
-	ctx := context.Background()
-	if !client.Alive(ctx) {
-		_, _ = fmt.Fprintf(w, "  ✗ Ollama unreachable at %s — embeddings paused\n", cfg.Embedding.OllamaURL)
-		return nil
-	}
-	present, err := client.HasModel(ctx)
-	if err != nil {
-		_, _ = fmt.Fprintf(w, "  ! Ollama check failed: %v\n", err)
-		return nil
-	}
-	if present {
-		_, _ = fmt.Fprintf(w, "  ✓ Ollama model %s installed\n", cfg.Embedding.Model)
-	} else {
-		_, _ = fmt.Fprintf(w, "  ✗ Ollama model %s missing — run: ollama pull %s\n", cfg.Embedding.Model, cfg.Embedding.Model)
 	}
 	return nil
 }
