@@ -283,6 +283,42 @@ func TestWriteOpencodeConfig_PreservesMode(t *testing.T) {
 			t.Errorf("mode = %o, want 600", got)
 		}
 	})
+
+	t.Run("symlinked config preserves the symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real.json")
+		link := filepath.Join(dir, "opencode.json")
+		if err := os.WriteFile(real, []byte(`{"mcp":{}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeOpencodeConfig(link, map[string]any{"mcp": map[string]any{"ghost": map[string]any{"type": "local", "command": []string{"ghost", "mcp"}, "enabled": true}}}); err != nil {
+			t.Fatalf("writeOpencodeConfig: %v", err)
+		}
+		fi, err := os.Lstat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatal("writeOpencodeConfig replaced the symlink with a regular file")
+		}
+		target, err := os.Readlink(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target != real {
+			t.Errorf("symlink target = %q, want %q", target, real)
+		}
+		data, err := os.ReadFile(real)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "ghost") {
+			t.Errorf("real file not updated: %s", data)
+		}
+	})
 }
 
 func TestCheckPrereqs_ProbesCommonDirs(t *testing.T) {

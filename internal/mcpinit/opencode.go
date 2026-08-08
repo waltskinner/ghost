@@ -281,14 +281,24 @@ func stripJSONCComments(data []byte) []byte {
 // writeOpencodeConfig writes the config atomically: temp file + rename in the
 // target directory, after creating it if needed. The on-disk file preserves its
 // prior mode; a new file defaults to 0600 so provider API keys stay private.
+// If path is a symlink (common under stow/chezmoi dotfile setups), the write
+// resolves through it and renames onto the real target instead of replacing
+// the symlink itself.
 func writeOpencodeConfig(path string, cfg map[string]any) error {
-	dir := filepath.Dir(path)
+	writePath := path
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			writePath = resolved
+		}
+	}
+
+	dir := filepath.Dir(writePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create dir %s: %w", dir, err)
 	}
 
 	mode := os.FileMode(0600)
-	if st, err := os.Stat(path); err == nil {
+	if st, err := os.Stat(writePath); err == nil {
 		mode = st.Mode().Perm()
 	}
 
@@ -317,7 +327,7 @@ func writeOpencodeConfig(path string, cfg map[string]any) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := os.Rename(tmpPath, writePath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp file: %w", err)
 	}
