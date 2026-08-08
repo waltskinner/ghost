@@ -3,8 +3,6 @@ package mcpinit
 import (
 	"bytes"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,6 +56,9 @@ func statusEnv(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GHOST_EMBEDDING_ENABLED", "false")
+	orig := systemBinDirs
+	systemBinDirs = nil
+	t.Cleanup(func() { systemBinDirs = orig })
 }
 
 // writeStubGhost creates an executable `ghost` stub in a temp dir and returns
@@ -188,17 +189,7 @@ func TestStatusOpencode_MCPConfigNotRegistered(t *testing.T) {
 // fresh (empty) database with a stubbed Ollama, verifying the total==0
 // embeddings check passes and the whole run stays healthy.
 func TestStatusOpencode_EmptyStoreHealthy(t *testing.T) {
-	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/":
-			w.WriteHeader(http.StatusOK)
-		case "/api/tags":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"models":[{"name":"nomic-embed-text:v1.5"}]}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
+	ollama := ollamaStub("nomic-embed-text:v1.5")
 	defer ollama.Close()
 
 	statusEnv(t)

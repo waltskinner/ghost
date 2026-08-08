@@ -115,11 +115,15 @@ func checkPrereqs(w io.Writer, client string) (ghostBin, claudeBin string, err e
 	return ghostBin, claudeBin, nil
 }
 
+// systemBinDirs are absolute install dirs probed after the home-relative ones.
+// Tests override this to stay isolated from host binaries.
+var systemBinDirs = []string{"/opt/homebrew/bin", "/usr/local/bin"}
+
 // findBinary locates name on PATH first, then falls back to common install
 // directories that are typically not on PATH (e.g. ~/.local/bin for the claude
-// native installer, ~/go/bin for go install). The probe dirs are derived from
-// the effective home dir so tests that set HOME stay isolated from host
-// binaries.
+// native installer, ~/go/bin for go install). Home-relative dirs follow the
+// effective HOME; the systemBinDirs list is absolute, so tests that must stay
+// isolated from host binaries override it.
 func findBinary(name string) string {
 	if p, err := exec.LookPath(name); err == nil {
 		return p
@@ -128,12 +132,10 @@ func findBinary(name string) string {
 	if err != nil {
 		return ""
 	}
-	for _, dir := range []string{
+	for _, dir := range append([]string{
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, "go", "bin"),
-		"/opt/homebrew/bin",
-		"/usr/local/bin",
-	} {
+	}, systemBinDirs...) {
 		p := filepath.Join(dir, name)
 		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode().Perm()&0o111 != 0 {
 			return p

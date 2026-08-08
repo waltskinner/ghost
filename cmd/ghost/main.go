@@ -119,27 +119,48 @@ func runMCP() {
 	}
 }
 
+// parseMCPClient parses the --client flag value (either "--client NAME" or
+// "--client=NAME") from args, returning the name or an error when the flag is
+// present with no value. The caller supplies the default for an absent flag.
+func parseMCPClient(args []string) (string, error) {
+	var client string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--client":
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("--client requires a value (claude or opencode)")
+			}
+			client = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--client="):
+			client = strings.TrimPrefix(args[i], "--client=")
+			if client == "" {
+				return "", fmt.Errorf("--client requires a value (claude or opencode)")
+			}
+		}
+	}
+	return client, nil
+}
+
 // runMCPInit configures an MCP client to use Ghost as its memory system.
 // Defaults to Claude Code; --client opencode targets opencode instead.
 func runMCPInit() {
-	var client string
-	dryRun := false
-	for i := 3; i < len(os.Args); i++ {
-		switch {
-		case os.Args[i] == "--dry-run":
-			dryRun = true
-		case os.Args[i] == "--client" && i+1 < len(os.Args):
-			client = os.Args[i+1]
-			i++
-		case strings.HasPrefix(os.Args[i], "--client="):
-			client = strings.TrimPrefix(os.Args[i], "--client=")
-		}
+	client, err := parseMCPClient(os.Args[3:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 	if client == "" {
 		client = "claude"
 	}
 
-	var err error
+	dryRun := false
+	for _, a := range os.Args[3:] {
+		if a == "--dry-run" {
+			dryRun = true
+		}
+	}
+
 	switch client {
 	case "opencode":
 		err = mcpinit.RunOpencode(os.Stdout, dryRun)
@@ -158,21 +179,15 @@ func runMCPInit() {
 // runMCPStatus checks the health of the Ghost ↔ MCP client integration.
 // Defaults to Claude Code; --client opencode reports opencode-specific checks.
 func runMCPStatus() {
-	var client string
-	for i := 3; i < len(os.Args); i++ {
-		switch {
-		case os.Args[i] == "--client" && i+1 < len(os.Args):
-			client = os.Args[i+1]
-			i++
-		case strings.HasPrefix(os.Args[i], "--client="):
-			client = strings.TrimPrefix(os.Args[i], "--client=")
-		}
+	client, err := parseMCPClient(os.Args[3:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 	if client == "" {
 		client = "claude"
 	}
 
-	var err error
 	switch client {
 	case "opencode":
 		err = mcpinit.StatusOpencode(os.Stdout)

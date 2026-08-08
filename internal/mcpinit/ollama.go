@@ -27,7 +27,11 @@ func checkOllama(w io.Writer, cfg *config.Config, check func(ok bool, pass, fail
 		return
 	}
 	present, err := client.HasModel(ctx)
-	check(err == nil && present,
+	if err != nil {
+		check(false, "", fmt.Sprintf("Ollama model check failed: %v", err))
+		return
+	}
+	check(present,
 		fmt.Sprintf("Ollama model %s installed", cfg.Embedding.Model),
 		fmt.Sprintf("Ollama model %s missing — run: ollama pull %s", cfg.Embedding.Model, cfg.Embedding.Model))
 }

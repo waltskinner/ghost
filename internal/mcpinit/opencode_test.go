@@ -11,14 +11,14 @@ import (
 
 // setupOpencodeTestEnv isolates a RunOpencode test: HOME and XDG_CONFIG_HOME
 // point at temp dirs, PATH contains only a stub ghost binary (no claude, no
-// opencode), so common-dir probing and the CLI verify path cannot reach host
-// binaries.
+// opencode), and embeddings are disabled so the Ollama check stays offline.
 func setupOpencodeTestEnv(t *testing.T) (home, xdg string) {
 	t.Helper()
 	home = t.TempDir()
 	t.Setenv("HOME", home)
 	xdg = t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("GHOST_EMBEDDING_ENABLED", "false")
 
 	binDir := filepath.Join(home, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
@@ -68,8 +68,12 @@ func TestRunOpencode_NoClaudeRequired(t *testing.T) {
 		t.Errorf("expected type local, got %v", ghost["type"])
 	}
 	cmd, ok := ghost["command"].([]any)
-	if !ok || len(cmd) != 2 || cmd[0] != "ghost" || cmd[1] != "mcp" {
-		t.Errorf("expected command [ghost mcp], got %v", ghost["command"])
+	if !ok || len(cmd) != 2 || cmd[1] != "mcp" {
+		t.Errorf("expected command [<ghost> mcp], got %v", ghost["command"])
+	}
+	first, ok := cmd[0].(string)
+	if !ok || filepath.Base(first) != "ghost" {
+		t.Errorf("expected command[0] to be the ghost binary, got %v", cmd[0])
 	}
 	if ghost["enabled"] != true {
 		t.Errorf("expected enabled true, got %v", ghost["enabled"])
@@ -194,6 +198,93 @@ func TestRunOpencode_MergesIntoExistingJSONC(t *testing.T) {
 	}
 }
 
+// TestRunOpencode_MergesIntoJSONCWithComments covers the previously-missing
+// JSONC forms: /* block comments */ and trailing commas, plus warning that the
+// rewrite drops comments.
+func TestRunOpencode_MergesJSONCWithBlockCommentsAndTrailingCommas(t *testing.T) {
+	_, xdg := setupOpencodeTestEnv(t)
+	dir := filepath.Join(xdg, "opencode")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	jsonc := filepath.Join(dir, "opencode.jsonc")
+	existing := `{
+  /* global theme */
+  "theme": "dark",
+  "mcp": {
+    "other": {"type": "local", "command": ["node", "server.js"]},
+  },
+}
+`
+	if err := os.WriteFile(jsonc, []byte(existing), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := RunOpencode(&out, false); err != nil {
+		t.Fatalf("RunOpencode: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "warning: rewriting opencode.jsonc") {
+		t.Errorf("expected comment-drop warning, got:\n%s", output)
+	}
+
+	data, err := os.ReadFile(jsonc)
+	if err != nil {
+		t.Fatalf("read opencode.jsonc: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("merged config must be valid JSON (block comments + trailing commas stripped): %v\n%s", err, data)
+	}
+	if cfg["theme"] != "dark" {
+		t.Errorf("expected existing theme key preserved, got %v", cfg["theme"])
+	}
+	mcp, _ := cfg["mcp"].(map[string]any)
+	if mcp == nil || mcp["ghost"] == nil {
+		t.Errorf("expected mcp.ghost merged in, got %v", mcp)
+	}
+}
+
+// TestWriteOpencodeConfig_PreservesMode pins the config file mode: an existing
+// 0600 file stays 0600 after a rewrite (the previous 0644 chmod would have
+// widened it), and a new file defaults to 0600.
+func TestWriteOpencodeConfig_PreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.json")
+
+	t.Run("existing 0600 file preserves mode", func(t *testing.T) {
+		if err := os.WriteFile(path, []byte(`{"mcp":{}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeOpencodeConfig(path, map[string]any{"mcp": map[string]any{"ghost": map[string]any{"type": "local", "command": []string{"ghost", "mcp"}, "enabled": true}}}); err != nil {
+			t.Fatalf("writeOpencodeConfig: %v", err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.Mode().Perm() & 0o777; got != 0600 {
+			t.Errorf("mode = %o, want 600", got)
+		}
+	})
+
+	t.Run("new file defaults to 0600", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "opencode.json")
+		if err := writeOpencodeConfig(path, map[string]any{"mcp": map[string]any{}}); err != nil {
+			t.Fatalf("writeOpencodeConfig: %v", err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.Mode().Perm() & 0o777; got != 0600 {
+			t.Errorf("mode = %o, want 600", got)
+		}
+	})
+}
+
 func TestCheckPrereqs_ProbesCommonDirs(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -227,6 +318,10 @@ func TestCheckPrereqs_ProbesCommonDirs(t *testing.T) {
 func TestCheckPrereqs_ClaudeMissing(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("GHOST_EMBEDDING_ENABLED", "false")
+	orig := systemBinDirs
+	systemBinDirs = nil
+	t.Cleanup(func() { systemBinDirs = orig })
 	binDir := filepath.Join(home, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatal(err)

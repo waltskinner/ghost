@@ -2,6 +2,7 @@ package mcpinit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/wcatz/ghost/internal/config"
 )
@@ -24,13 +26,14 @@ func RunOpencode(w io.Writer, dryRun bool) error {
 
 	// Step 1: Prerequisites — only the ghost binary is required.
 	_, _ = fmt.Fprintln(w, "[1/2] Checking prerequisites...")
-	if _, _, err := checkPrereqs(w, "opencode"); err != nil {
+	ghostBin, _, err := checkPrereqs(w, "opencode")
+	if err != nil {
 		return retryHint(err)
 	}
 
 	// Step 2: MCP server registration.
 	_, _ = fmt.Fprintln(w, "\n[2/2] Registering MCP server...")
-	changed, err := registerOpencodeMCP(w, dryRun)
+	changed, err := registerOpencodeMCP(w, ghostBin, dryRun)
 	if err != nil {
 		return retryHint(err)
 	}
@@ -63,7 +66,7 @@ func RunOpencode(w io.Writer, dryRun bool) error {
 // registerOpencodeMCP deep-merges the ghost MCP server entry into opencode's
 // config, preserving all other keys. It returns true when the config was
 // (or would be, for a dry run) written.
-func registerOpencodeMCP(w io.Writer, dryRun bool) (bool, error) {
+func registerOpencodeMCP(w io.Writer, ghostBin string, dryRun bool) (bool, error) {
 	path, err := opencodeConfigPath()
 	if err != nil {
 		return false, err
@@ -74,7 +77,7 @@ func registerOpencodeMCP(w io.Writer, dryRun bool) (bool, error) {
 		return false, err
 	}
 
-	if mcpGhostAlreadyRegistered(cfg) {
+	if mcpGhostAlreadyRegistered(cfg, ghostBin) {
 		_, _ = fmt.Fprintln(w, "  ✓ ghost MCP server already registered")
 		return false, nil
 	}
@@ -84,7 +87,10 @@ func registerOpencodeMCP(w io.Writer, dryRun bool) (bool, error) {
 		return true, nil
 	}
 
-	setMCPGhost(cfg)
+	setMCPGhost(cfg, ghostBin)
+	if strings.HasSuffix(path, ".jsonc") {
+		_, _ = fmt.Fprintln(w, "  ! warning: rewriting opencode.jsonc will drop its existing comments and formatting")
+	}
 	if err := writeOpencodeConfig(path, cfg); err != nil {
 		return false, err
 	}
@@ -101,7 +107,9 @@ func verifyOpencodeRegistration(w io.Writer) {
 		_, _ = fmt.Fprintln(w, "opencode CLI not found in PATH — manual config route: add {\"mcp\":{\"ghost\":{\"type\":\"local\",\"command\":[\"ghost\",\"mcp\"],\"enabled\":true}}} to the opencode config")
 		return
 	}
-	out, err := exec.Command(ocBin, "mcp", "ls").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, ocBin, "mcp", "ls").CombinedOutput()
 	if err != nil {
 		_, _ = fmt.Fprintf(w, "  ! could not verify registration (`opencode mcp ls` failed): %s\n", strings.TrimSpace(string(out)))
 		return
@@ -113,26 +121,37 @@ func verifyOpencodeRegistration(w io.Writer) {
 	}
 }
 
-// mcpGhostAlreadyRegistered reports whether the config already has an mcp.ghost
-// entry with command ["ghost","mcp"].
-func mcpGhostAlreadyRegistered(cfg map[string]any) bool {
+// mcpGhostCommand reports the mcp.ghost entry's command[0] if an entry with
+// command base "ghost" and command[1] "mcp" exists.
+func mcpGhostCommand(cfg map[string]any) (string, bool) {
 	mcp, ok := cfg["mcp"].(map[string]any)
 	if !ok {
-		return false
+		return "", false
 	}
 	ghost, ok := mcp["ghost"].(map[string]any)
 	if !ok {
-		return false
+		return "", false
 	}
 	cmd, ok := ghost["command"].([]any)
 	if !ok || len(cmd) != 2 {
-		return false
+		return "", false
 	}
-	return cmd[0] == "ghost" && cmd[1] == "mcp"
+	first, ok := cmd[0].(string)
+	if !ok {
+		return "", false
+	}
+	return first, filepath.Base(first) == "ghost" && cmd[1] == "mcp"
+}
+
+// mcpGhostAlreadyRegistered reports whether the config's mcp.ghost entry uses
+// `ghost mcp` as its command and points at the currently resolved ghost binary.
+func mcpGhostAlreadyRegistered(cfg map[string]any, ghostBin string) bool {
+	first, ok := mcpGhostCommand(cfg)
+	return ok && first == ghostBin
 }
 
 // setMCPGhost deep-merges the ghost MCP server entry into the config.
-func setMCPGhost(cfg map[string]any) {
+func setMCPGhost(cfg map[string]any, ghostBin string) {
 	mcp, ok := cfg["mcp"].(map[string]any)
 	if !ok {
 		mcp = make(map[string]any)
@@ -140,7 +159,7 @@ func setMCPGhost(cfg map[string]any) {
 	}
 	mcp["ghost"] = map[string]any{
 		"type":    "local",
-		"command": []string{"ghost", "mcp"},
+		"command": []string{ghostBin, "mcp"},
 		"enabled": true,
 	}
 }
@@ -173,7 +192,8 @@ func opencodeConfigDir() (string, error) {
 }
 
 // loadOpencodeConfig reads and parses the config file, tolerating // line
-// comments in .jsonc files. A missing or empty file yields an empty config.
+// comments, /* block comments */, and trailing commas in .jsonc files. A
+// missing or empty file yields an empty config.
 func loadOpencodeConfig(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -198,8 +218,9 @@ func loadOpencodeConfig(path string) (map[string]any, error) {
 	return cfg, nil
 }
 
-// stripJSONCComments removes // line comments from JSONC content while leaving
-// string contents (and URLs) intact.
+// stripJSONCComments removes // line comments and /* block comments */ from
+// JSONC content while leaving string contents (and URLs) intact, and drops
+// trailing commas before } and ].
 func stripJSONCComments(data []byte) []byte {
 	var out []byte
 	inStr := false
@@ -230,9 +251,26 @@ func stripJSONCComments(data []byte) []byte {
 				if i < len(data) {
 					out = append(out, '\n')
 				}
+			} else if i+1 < len(data) && data[i+1] == '*' {
+				// Skip everything until the matching */. Nested markers are
+				// not valid in JSONC, so a simple scan suffices.
+				for i < len(data)-1 && !(data[i] == '*' && data[i+1] == '/') {
+					i++
+				}
+				i++ // consume the final '*' (the '/' is consumed by the loop)
 			} else {
 				out = append(out, c)
 			}
+		case '}', ']':
+			// Drop a trailing comma left before this closing bracket.
+			n := len(out) - 1
+			for n >= 0 && (out[n] == ' ' || out[n] == '\t' || out[n] == '\n') {
+				n--
+			}
+			if n >= 0 && out[n] == ',' {
+				out = append(out[:n], out[n+1:]...)
+			}
+			out = append(out, c)
 		default:
 			out = append(out, c)
 		}
@@ -241,11 +279,17 @@ func stripJSONCComments(data []byte) []byte {
 }
 
 // writeOpencodeConfig writes the config atomically: temp file + rename in the
-// target directory, after creating it if needed.
+// target directory, after creating it if needed. The on-disk file preserves its
+// prior mode; a new file defaults to 0600 so provider API keys stay private.
 func writeOpencodeConfig(path string, cfg map[string]any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create dir %s: %w", dir, err)
+	}
+
+	mode := os.FileMode(0600)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
 	}
 
 	out, err := json.MarshalIndent(cfg, "", "  ")
@@ -269,7 +313,7 @@ func writeOpencodeConfig(path string, cfg map[string]any) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Chmod(tmpPath, 0644); err != nil {
+	if err := os.Chmod(tmpPath, mode); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
