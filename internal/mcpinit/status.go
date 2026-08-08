@@ -212,7 +212,13 @@ func checkStoreHealth(w io.Writer, check func(ok bool, pass, fail string)) *memo
 	}
 	dbPath := filepath.Join(dataDir, "ghost.db")
 	if _, err := os.Stat(dbPath); err != nil {
-		_, _ = fmt.Fprintln(w, "  - no Ghost database (run ghost first)")
+		if os.IsNotExist(err) {
+			_, _ = fmt.Fprintln(w, "  - no Ghost database (run ghost first)")
+			return nil
+		}
+		// Permission, I/O, or other errors must fail the run rather than
+		// masquerading as a fresh install.
+		check(false, "", fmt.Sprintf("database: %v", err))
 		return nil
 	}
 	db, err := memory.OpenDB(dbPath)

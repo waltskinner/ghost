@@ -254,7 +254,7 @@ func stripJSONCComments(data []byte) []byte {
 			} else if i+1 < len(data) && data[i+1] == '*' {
 				// Skip everything until the matching */. Nested markers are
 				// not valid in JSONC, so a simple scan suffices.
-				for i < len(data)-1 && !(data[i] == '*' && data[i+1] == '/') {
+				for i < len(data)-1 && (data[i] != '*' || data[i+1] != '/') {
 					i++
 				}
 				i++ // consume the final '*' (the '/' is consumed by the loop)

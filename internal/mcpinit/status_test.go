@@ -46,6 +46,45 @@ func TestStatus_ReportsOpenDBFailure(t *testing.T) {
 	}
 }
 
+// TestStatus_ReportsInaccessibleDatabase verifies that a database which cannot
+// be stat'd for a reason other than absence (e.g. a permission error) is
+// surfaced as a failed check instead of being reported as a fresh install.
+func TestStatus_ReportsInaccessibleDatabase(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks cannot fail as root")
+	}
+	statusEnv(t)
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	ghostDir := filepath.Join(dataHome, "ghost")
+	if err := os.MkdirAll(ghostDir, 0o700); err != nil {
+		t.Fatalf("mkdir ghost dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ghostDir, "ghost.db"), nil, 0o600); err != nil {
+		t.Fatalf("write db file: %v", err)
+	}
+	// Strip read+traverse so os.Stat on the database returns EACCES.
+	if err := os.Chmod(ghostDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ghostDir, 0o700) }) // let TempDir removal succeed
+
+	var out bytes.Buffer
+	if err := Status(&out); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "✗ database:") {
+		t.Errorf("expected a failed database check, got:\n%s", output)
+	}
+	if strings.Contains(output, "no Ghost database (run ghost first)") {
+		t.Errorf("a permission error is not a fresh install, got:\n%s", output)
+	}
+	if strings.Contains(output, "All checks passed.") {
+		t.Errorf("an inaccessible database must not report \"All checks passed.\", got:\n%s", output)
+	}
+}
+
 // statusEnv isolates a status run from the host: no binaries on PATH or in the
 // common install dirs, a clean XDG_CONFIG_HOME/XDG_DATA_HOME, and embeddings
 // disabled so the Ollama check can't reach the network.
