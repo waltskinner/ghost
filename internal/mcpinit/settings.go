@@ -249,6 +249,161 @@ func (s *settingsFile) hasHook(event, cmdSubstr string) bool {
 	return false
 }
 
+// isJSONNull reports whether raw is the JSON literal null. json.Unmarshal
+// happily decodes null into a map or slice as nil with no error, which would
+// otherwise make an explicit null indistinguishable from "absent" — that
+// distinction matters here because "absent" is safe to fill in via addHook,
+// while an explicit null is structurally-invalid-but-present data that must
+// halt reconciliation instead.
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
+}
+
+// findHookCommand returns the first hook command for event containing
+// cmdSubstr, and whether one was found. err is non-nil when the existing
+// "hooks" value (or the specific event's value within it) is present but
+// structurally invalid — including explicit JSON null, which unmarshals into
+// a nil map/slice with no error — so callers must treat that as "stop", not
+// "absent": proceeding to addHook on a nil "hooks" map panics, and on a nil
+// per-event value silently discards it.
+func (s *settingsFile) findHookCommand(event, cmdSubstr string) (cmd string, ok bool, err error) {
+	hooksRaw, present := s.raw["hooks"]
+	if !present {
+		return "", false, nil
+	}
+	if isJSONNull(hooksRaw) {
+		return "", false, fmt.Errorf("hooks is null")
+	}
+
+	var hooksMap map[string]json.RawMessage
+	if uerr := json.Unmarshal(hooksRaw, &hooksMap); uerr != nil {
+		return "", false, fmt.Errorf("parse hooks: %w", uerr)
+	}
+
+	eventRaw, present := hooksMap[event]
+	if !present {
+		return "", false, nil
+	}
+	if isJSONNull(eventRaw) {
+		return "", false, fmt.Errorf("hooks[%s] is null", event)
+	}
+
+	var entries []hookEntry
+	if uerr := json.Unmarshal(eventRaw, &entries); uerr != nil {
+		return "", false, fmt.Errorf("parse %s hooks: %w", event, uerr)
+	}
+
+	for _, entry := range entries {
+		for _, h := range entry.Hooks {
+			if strings.Contains(h.Command, cmdSubstr) {
+				return h.Command, true, nil
+			}
+		}
+	}
+	return "", false, nil
+}
+
+// hasExactHookCommand reports whether any hook command for event exactly
+// equals cmd. Used to find the precise pre-#251 legacy command rather than
+// anything that merely contains the same substring — a hand-edited wrapper
+// can legitimately contain "hook session-start" too, and must never be
+// mistaken for the legacy command.
+func (s *settingsFile) hasExactHookCommand(event, cmd string) (bool, error) {
+	hooksRaw, present := s.raw["hooks"]
+	if !present {
+		return false, nil
+	}
+	if isJSONNull(hooksRaw) {
+		return false, fmt.Errorf("hooks is null")
+	}
+
+	var hooksMap map[string]json.RawMessage
+	if err := json.Unmarshal(hooksRaw, &hooksMap); err != nil {
+		return false, fmt.Errorf("parse hooks: %w", err)
+	}
+
+	eventRaw, present := hooksMap[event]
+	if !present {
+		return false, nil
+	}
+	if isJSONNull(eventRaw) {
+		return false, fmt.Errorf("hooks[%s] is null", event)
+	}
+
+	var entries []hookEntry
+	if err := json.Unmarshal(eventRaw, &entries); err != nil {
+		return false, fmt.Errorf("parse %s hooks: %w", event, err)
+	}
+
+	for _, entry := range entries {
+		for _, h := range entry.Hooks {
+			if h.Command == cmd {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// replaceHookCommand rewrites every hook command for event that exactly
+// equals oldCmd to newCmd — an exact match, not a substring one, so a
+// hand-edited command that merely contains the same text is never touched.
+// Like addHook, it only unmarshals/re-marshals hooks[event], so it does not
+// disturb other events or unrelated top-level keys. Returns false if no
+// exact match was found.
+func (s *settingsFile) replaceHookCommand(event, oldCmd, newCmd string) (bool, error) {
+	raw, ok := s.raw["hooks"]
+	if !ok {
+		return false, nil
+	}
+	if isJSONNull(raw) {
+		return false, fmt.Errorf("hooks is null")
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		return false, fmt.Errorf("parse hooks: %w", err)
+	}
+
+	eventRaw, ok := hooks[event]
+	if !ok {
+		return false, nil
+	}
+	if isJSONNull(eventRaw) {
+		return false, fmt.Errorf("hooks[%s] is null", event)
+	}
+	var entries []hookEntry
+	if err := json.Unmarshal(eventRaw, &entries); err != nil {
+		return false, fmt.Errorf("parse %s hooks: %w", event, err)
+	}
+
+	found := false
+	for i := range entries {
+		for j := range entries[i].Hooks {
+			if entries[i].Hooks[j].Command == oldCmd {
+				entries[i].Hooks[j].Command = newCmd
+				found = true
+			}
+		}
+	}
+	if !found {
+		return false, nil
+	}
+
+	entriesJSON, err := json.Marshal(entries)
+	if err != nil {
+		return false, err
+	}
+	hooks[event] = entriesJSON
+
+	hooksJSON, err := json.Marshal(hooks)
+	if err != nil {
+		return false, err
+	}
+	s.raw["hooks"] = hooksJSON
+	return true, nil
+}
+
 // addHook adds a hook entry for the given event. Does not clobber existing hooks.
 func (s *settingsFile) addHook(event string, entry hookEntry) error {
 	var hooks map[string]json.RawMessage
@@ -256,7 +411,8 @@ func (s *settingsFile) addHook(event string, entry hookEntry) error {
 		if err := json.Unmarshal(raw, &hooks); err != nil {
 			hooks = make(map[string]json.RawMessage)
 		}
-	} else {
+	}
+	if hooks == nil {
 		hooks = make(map[string]json.RawMessage)
 	}
 

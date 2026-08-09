@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -158,6 +159,199 @@ func TestAddHook_PreservesExisting(t *testing.T) {
 	}
 	if _, ok := hooks["SessionStart"]; !ok {
 		t.Error("SessionStart hook was not added")
+	}
+}
+
+func TestFindHookCommand_NotPresent(t *testing.T) {
+	path := tempSettings(t, `{}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := sf.findHookCommand("SessionStart", "hook session-start"); ok || err != nil {
+		t.Errorf("expected findHookCommand to return (_, false, nil), got (_, %v, %v)", ok, err)
+	}
+}
+
+func TestFindHookCommand_Present(t *testing.T) {
+	path := tempSettings(t, `{}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := hookEntry{Hooks: []hookAction{{Type: "command", Command: "ghost hook session-start"}}}
+	if err := sf.addHook("SessionStart", entry); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := sf.findHookCommand("SessionStart", "hook session-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "ghost hook session-start" {
+		t.Errorf("findHookCommand = (%q, %v), want (%q, true)", got, ok, "ghost hook session-start")
+	}
+}
+
+func TestFindHookCommand_MalformedHooksReturnsError(t *testing.T) {
+	path := tempSettings(t, `{"hooks":[]}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sf.findHookCommand("SessionStart", "hook session-start"); err == nil {
+		t.Error("expected findHookCommand to return an error for a malformed hooks value")
+	}
+}
+
+func TestFindHookCommand_NullHooksReturnsError(t *testing.T) {
+	path := tempSettings(t, `{"hooks":null}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sf.findHookCommand("SessionStart", "hook session-start"); err == nil {
+		t.Error("expected findHookCommand to return an error for hooks:null")
+	}
+}
+
+func TestFindHookCommand_NullEventReturnsError(t *testing.T) {
+	path := tempSettings(t, `{"hooks":{"SessionStart":null}}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sf.findHookCommand("SessionStart", "hook session-start"); err == nil {
+		t.Error("expected findHookCommand to return an error for hooks.SessionStart:null")
+	}
+}
+
+// TestAddHook_NeverCalledWithNullHooks documents the invariant that prevents
+// the CodeRabbit-flagged panic: addHook assigns into the "hooks" map
+// unconditionally, so it must never be reached when "hooks" is null. In
+// production the only caller is reconcileHook, which is gated behind
+// findHookCommand's error return — this test proves addHook itself no
+// longer panics even if that gate is bypassed, since json.Unmarshal of a
+// null root leaves the local map nil and the assignment below would panic
+// without the nil-guard added alongside these findHookCommand changes.
+func TestAddHook_NullHooksDoesNotPanic(t *testing.T) {
+	path := tempSettings(t, `{"hooks":null}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := hookEntry{Hooks: []hookAction{{Type: "command", Command: "ghost hook session-start"}}}
+	if err := sf.addHook("SessionStart", entry); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHasExactHookCommand(t *testing.T) {
+	path := tempSettings(t, `{}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := hookEntry{Hooks: []hookAction{{Type: "command", Command: "'/usr/local/bin/ghost' hook session-start"}}}
+	if err := sf.addHook("SessionStart", entry); err != nil {
+		t.Fatal(err)
+	}
+
+	exact, err := sf.hasExactHookCommand("SessionStart", "'/usr/local/bin/ghost' hook session-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exact {
+		t.Error("expected exact match to be found")
+	}
+
+	partial, err := sf.hasExactHookCommand("SessionStart", "hook session-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial {
+		t.Error("expected substring-only match to NOT be treated as exact")
+	}
+}
+
+func TestReplaceHookCommand_NoMatchingEvent(t *testing.T) {
+	path := tempSettings(t, `{}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := sf.replaceHookCommand("SessionStart", "hook session-start", "new command")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced {
+		t.Error("expected replaceHookCommand to return false when hooks are absent")
+	}
+}
+
+func TestReplaceHookCommand_PreservesOtherEventsAndFields(t *testing.T) {
+	legacy := "'/usr/local/bin/ghost' hook session-start"
+	existing := `{"hooks":{
+		"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"check.sh","timeout":30}]}],
+		"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"` + legacy + `"}]}]
+	}}`
+	path := tempSettings(t, existing)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desired := `"C:\ghost\ghost.exe" hook session-start`
+	replaced, err := sf.replaceHookCommand("SessionStart", legacy, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced {
+		t.Fatal("expected replaceHookCommand to report a match")
+	}
+
+	got, ok, err := sf.findHookCommand("SessionStart", "hook session-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != desired {
+		t.Errorf("SessionStart command = (%q, %v), want the replaced command", got, ok)
+	}
+
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(sf.raw["hooks"], &hooks); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(hooks["PreToolUse"]), `"timeout":30`) {
+		t.Errorf("PreToolUse entry lost its timeout field: %s", hooks["PreToolUse"])
+	}
+}
+
+func TestReplaceHookCommand_DoesNotTouchNonExactMatch(t *testing.T) {
+	wrapper := "'/opt/wrap.sh' --run 'hook session-start' --extra"
+	path := tempSettings(t, `{}`)
+	sf, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := hookEntry{Hooks: []hookAction{{Type: "command", Command: wrapper}}}
+	if err := sf.addHook("SessionStart", entry); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced, err := sf.replaceHookCommand("SessionStart", "'/usr/local/bin/ghost' hook session-start", "new command")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced {
+		t.Error("expected replaceHookCommand to report no match for a command that only contains the substring")
+	}
+
+	got, ok, err := sf.findHookCommand("SessionStart", "hook session-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != wrapper {
+		t.Errorf("wrapper command was altered: got (%q, %v), want untouched %q", got, ok, wrapper)
 	}
 }
 
