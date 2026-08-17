@@ -41,8 +41,8 @@ already knows how to locate (`transcript_path` arrives on every hook's stdin).
 
 The design adds `ghost_capture`: an MCP tool that reads a bounded slice of the current
 session's transcript and asks the *calling session's own model* (via MCP sampling, zero
-Anthropic credits) to extract memories from it. The model is the transcript reader; the
-tool supplies the transcript, dedup context, and the write gate.
+Anthropic credits) to extract memories from it. The tool supplies the transcript slice,
+dedup context, and the write gate; the sampling model does the extraction.
 
 **Trigger** is a nudge from the `Stop` hook (which supports `additionalContext`, a
 non-error guidance that continues the turn). Because `Stop` fires every turn, capture
