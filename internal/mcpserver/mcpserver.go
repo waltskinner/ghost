@@ -978,7 +978,7 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "ghost_resolve",
 		Title:       "Resolve stale evidence",
-		Description: "Scans a project's memories for resolved-evidence notes (intermediate findings, changelog entries, superseded experiments) using the calling session's own model via MCP sampling — no Anthropic API credits spent. Dry-run by default; pass apply:true to stamp resolved_at.",
+		Description: "Scans a project's memories for resolved-evidence notes (intermediate findings, changelog entries, superseded experiments) using the calling session's own model via MCP sampling when the client supports it, falling back to a subscription-billed `claude -p` call otherwise (dry-run only on that fallback). No Anthropic API credits spent either way. Dry-run by default; pass apply:true to stamp resolved_at.",
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(false),
 			OpenWorldHint:   boolPtr(false),
@@ -998,12 +998,16 @@ func (s *Server) registerTools() {
 		if !ok {
 			return nil, nil, fmt.Errorf("ghost_resolve: store does not support resolve operations")
 		}
-		if req.Session == nil {
-			return nil, nil, fmt.Errorf("ghost_resolve: no active MCP session for sampling")
-		}
+		// req.Session is never nil here: every ServerRequest the go-sdk
+		// dispatches to a tool handler is constructed from a live
+		// *ServerSession (see mcp.ServerRequest's construction sites in
+		// shared.go/server.go) — there is no headless-invocation path for an
+		// MCP tool. The claude CLI fallback is always a fallback, never a
+		// full-trust primary, so an apply:true request can never write a
+		// CLI-only classification (see resolve.Run's anyFallback guard).
 		samplingProvider := ai.NewSamplingProvider(req.Session)
-		fallback := ai.NewFallbackProvider(samplingProvider, nil, false)
-		cls := resolve.NewHaikuClassifier(fallback)
+		provider := ai.NewAlwaysFallbackProvider(samplingProvider, ai.NewCLIClient(), true)
+		cls := resolve.NewHaikuClassifier(provider)
 		res, confirmed, err := resolve.Run(ctx, rs, cls, projectID, args.Apply, s.logger)
 		if err != nil {
 			return nil, nil, fmt.Errorf("ghost_resolve: %w", err)
@@ -1018,6 +1022,9 @@ func (s *Server) registerTools() {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%s: %d loaded, %d after prefilter, %d confirmed evidence, %s %d\n",
 			args.Project, res.Loaded, res.Candidates, res.Confirmed, verb, count)
+		if res.SkippedApply {
+			sb.WriteString("  apply skipped: classification used the claude CLI fallback (MCP sampling unavailable on this client) — rerun once sampling works to actually stamp resolved_at\n")
+		}
 		for _, m := range confirmed {
 			fmt.Fprintf(&sb, "  %s  [%s]  %s\n", shortID(m.ID), m.Category, firstLine(m.Content, 70))
 		}
