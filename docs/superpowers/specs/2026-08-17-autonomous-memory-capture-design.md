@@ -61,9 +61,9 @@ when omitted the tool reads the pending marker (see §3.3) for the latest sessio
 
 Flow:
 
-1. **Locate the transcript.** From the `transcript_path` arg, or the pending marker
-   (`<dataDir>/capture-pending.json`). No marker and no arg → return a short
-   "nothing pending" message, not an error.
+1. **Locate the transcript.** Prefer the explicit `transcript_path` arg; otherwise read
+   the pending marker (`<dataDir>/capture-pending.json`). No marker and no arg → return a
+   short "nothing pending" message, not an error.
 2. **Resume from the capture cursor.** A per-project state file
    (`<dataDir>/capture-state-<projectID>.json`) records the last-captured transcript
    path and byte offset. Same path → stream from the offset (incremental); different
@@ -81,7 +81,8 @@ Flow:
    `importance ≥ capture.importance_threshold`. Everything else is returned as a
    *proposal* for the model to save explicitly. Auto-save reuses the same `Upsert`
    path `ghost_memory_save` uses, so FTS dedup, embedding, linking, and the
-   un-resolve-on-write revive all fire.
+   un-resolve-on-write revive all fire; then `notifyProjectResource(projectID, "context")`
+   like the other write tools.
 7. **Empty-set guard.** Zero candidates → no write, just "nothing new to save".
 8. **Commit.** Advance the capture cursor, clear the pending marker, and return a
    summary of saved vs proposed memories.
@@ -90,21 +91,25 @@ Flow:
 
 When `capture.enabled`, `ghost hook stop` becomes:
 
-1. `stop_hook_active` → return early (unchanged — prevents re-nudge loops).
-2. Write the pending marker (`session_id`, `transcript_path`, `cwd`).
-3. Scan the transcript as today: count tool calls, `ghost_memory_save`/`ghost_save_global`
+1. `stop_hook_active` → return early (unchanged — the turn is already continuing due to a
+   prior hook, so never re-nudge).
+2. Scan the transcript as today: count tool calls, `ghost_memory_save`/`ghost_save_global`
    calls, **and** `ghost_capture` calls.
-4. No tool calls → return.
-5. Saves or captures present → return.
-6. Otherwise emit **`additionalContext`** (not `decision:block`) pointing at
-   `ghost_capture`:
+3. No tool calls → return.
+4. Saves or captures present → clear the pending marker and return (already recorded).
+5. Read the pending marker. If it is for the **same session** and already marked
+   `nudged`, emit the original `decision:block` fallback and return.
+6. Otherwise write the marker (`session_id`, `transcript_path`, `cwd`, `nudged: true`) and
+   emit **`additionalContext`** (not `decision:block`):
    > "This session used tools but saved nothing to Ghost. Call `ghost_capture` to
-   > extract discoveries automatically, or stop again if there is nothing to save."
+   > extract discoveries from this session automatically."
 
-The existing `decision:block` remains only as a **last-resort fallback**: if a subsequent
-`Stop` fire (after the nudge continued the turn) still shows zero saves *and* zero
-captures, the original block-once fires. The `stop_hook_active` guard plus Claude Code's
-8-consecutive-continuation cap bound both mechanisms, exactly as today.
+The `nudged` flag is what makes "nudge once, then block" work. The immediate follow-up
+`Stop` after an `additionalContext` continuation carries `stop_hook_active: true` and
+returns at step 1 — so the block only fires on a *later* turn in the same session that
+still recorded nothing. Any save or capture clears the marker via step 4, resetting the
+cycle for the next burst of unrecorded work. The `stop_hook_active` guard plus Claude
+Code's 8-consecutive-continuation cap bound both mechanisms, exactly as today.
 
 ### 3.3 `ghost hook session-end` (new event)
 
@@ -151,6 +156,10 @@ reflect/resolve/supersede trifecta on `SessionEnd`.
 - **Untrusted content stays delimited.** Extracted memory text is stored data, and the
   existing `«…»` delimiter guard at injection continues to apply. The extraction prompt
   instructs the model to treat the existing-memories block as data, not instructions.
+- **Single-active-session marker.** `capture-pending.json` is one well-known file; two
+  concurrent foreground sessions in different projects race on it (last-writer-wins).
+  The explicit `transcript_path` arg is the escape hatch. Acceptable for a single-user
+  local tool — documented here rather than silently ignored.
 
 ---
 
@@ -158,11 +167,11 @@ reflect/resolve/supersede trifecta on `SessionEnd`.
 
 ```
 Stop hook fires (per turn)
-  → write capture-pending.json {session_id, transcript_path, cwd}
-  → scan transcript
+  → scan transcript (toolCalls, saves, captures)
   → toolCalls>0 && saves==0 && captures==0 ?
-       → additionalContext: "call ghost_capture"
-       → (next Stop, still nothing) → decision:block (fallback)
+       → marker already marked `nudged` for this session? → decision:block (fallback)
+       → else → write marker {session_id, transcript_path, cwd, nudged:true}
+              → additionalContext: "call ghost_capture"
 
 Model calls ghost_capture(project_id)
   → read marker → transcript_path
@@ -188,7 +197,7 @@ SessionEnd hook fires (once)
 | `ghost_capture` tool handler | wires store + sampling + capture pkg; marker/cursor read-write | `internal/capture`, `internal/mcpserver` |
 | `HandleStopHook` refine | marker write + additionalContext nudge + block fallback | `internal/mcpinit/stophook.go` |
 | `HandleSessionEndHook` (new) | detached reflect/resolve/supersede spawns | `internal/mcpinit` |
-| `cmd/ghost` hook wiring | `ghost hook session-end` subcommand + init/status entries | `internal/mcpinit` |
+| `cmd/ghost` hook wiring | `ghost hook session-end` subcommand + init/status entries + `mcp__ghost__ghost_capture` permission allowlist | `internal/mcpinit` |
 | `internal/config` | `capture.*` + `reflection.auto_reflect` | koanf defaults |
 
 Each unit is independently testable: the capture package against a fixture transcript;
