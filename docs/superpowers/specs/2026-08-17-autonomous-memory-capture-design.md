@@ -1,6 +1,10 @@
 # Autonomous memory creation: in-session transcript capture
 
-**Status:** Revised 2026-08-17 — added client scope, sampling-migration sequencing, and one flagged open question; pending re-review of this revision.
+**Status:** Revised 2026-08-17 (twice) — added client scope and one flagged open
+question; then corrected the SEP citations for MCP sampling's deprecation and added a
+live reproduction showing `ghost_resolve`'s sampling call currently fails in this
+environment. Pending re-review; the sampling-vs-CLIClient direction for `Extract` is
+unresolved.
 **Author:** Wayne (wcatz)
 **Builds on:** #297 "feat: autonomous memory lifecycle — auto reflect, supersede, and resolve"
 
@@ -64,10 +68,19 @@ Two open dependencies worth investigating before assuming permanent Claude-Code-
 status, neither of which this spec resolves:
 
 1. **Does the client support MCP sampling (`CreateMessage`) at all?** Not a new risk —
-   `ghost_resolve` already depends on this today, on every client, and whether it works
-   on anything other than Claude Code has never been verified. The new `Extract` method
-   (Components, below) simply inherits this existing, pre-existing unknown; see
-   Guardrails for the related synchronous-sampling concern.
+   `ghost_resolve` already depends on this today, on every client — and no longer
+   theoretical: live-tested against this exact Claude Code session while writing this
+   revision, `ghost_resolve` fails with `mcp sampling: calling "sampling/createMessage":
+   Method not found`. That is a plain JSON-RPC "unimplemented method" response from the
+   client, not the version-gated rejection `assertServerInitiatedRequestAllowed` would
+   produce server-side (see Guardrails) — evidence this session's negotiated protocol
+   predates the 2026-07-28 cutover and the client simply never answers this method,
+   rather than Ghost being on the wrong side of a version negotiation. Root cause (this
+   Claude Code build, the VSCode-extension surface specifically, or something
+   environment-local) not further isolated. Separately, opencode's MCP client does not
+   implement sampling either (tracked upstream as `anomalyco/opencode#11948`, open). The
+   new `Extract` method (Components, below) would inherit the same failure mode; see
+   Guardrails for the two related SEPs bearing on whether this is likely to improve.
 2. **Does the client expose any session-boundary or pre-continuation event Ghost could
    hook into?** Unknown for opencode and others — not investigated here.
 
@@ -222,13 +235,42 @@ here.
   concurrent foreground sessions in different projects race on it (last-writer-wins).
   The explicit `transcript_path` arg is the escape hatch. Acceptable for a single-user
   local tool — documented here rather than silently ignored.
-- **Sampling dependency, now doubled.** `Extract` reuses `Classify`'s synchronous
-  `CreateMessage` pattern — SEP-2322 will forbid exactly this pattern for clients that
-  negotiate newer MCP protocol versions, and `Extract`'s ~2000-token calls are a much
-  heavier, more latency-sensitive round-trip than `Classify`'s 16-token calls. This
-  design does not migrate to the async replacement; recommend doing that migration
-  first, or shaping `Extract` against the async pattern from the start, rather than
-  adding a second synchronous call site that needs the same rewrite later.
+- **Sampling is failing live, today, not just at future risk.** Live-tested against
+  the Claude Code session used to write this revision: `ghost_resolve` — the one
+  shipped tool built on `ai.SamplingProvider` — currently fails with
+  `mcp sampling: calling "sampling/createMessage": Method not found`. That is a
+  present-tense reproduction, not a projection. Building `Extract` the same way would
+  ship a second broken tool, so this must be resolved before `Extract` is implemented,
+  independent of anything below. Not yet resolved as of this revision — see §2's open
+  dependency above; no direction is decided in this document.
+  Two SEPs bear on why this is unlikely to self-resolve, and an earlier draft of this
+  bullet cited them sloppily — it called "SEP-2322" wrong and replaced it with
+  SEP-2577 as if one superseded the other. Both are real, both Final, and they say
+  different things:
+  - **SEP-2322** ("Multi Round-Trip Requests," Final) replaces synchronous
+    server-initiated requests (`CreateMessage`, `ListRoots`, `Elicit`) with an async
+    `InputRequests`/`InputRequiredResult` pattern once a client negotiates protocol
+    version ≥ 2026-07-28 — enforced server-side in `go-sdk@v1.7.0` by
+    `assertServerInitiatedRequestAllowed`. This is what the original (accurate) test
+    comment in `mcpserver_test.go` was describing. The live failure above did not
+    produce this specific rejection, which is evidence (not proof) that this session's
+    negotiated protocol predates the cutover and this SEP isn't what's currently
+    biting — but it will start to once a connecting client negotiates the newer
+    version, and `ai.SamplingProvider` has no InputRequests-shaped call path today.
+  - **SEP-2577** ("Deprecate Roots, Sampling, and Logging," Final) deprecates the
+    sampling capability itself, protocol-wide, as of the same 2026-07-28 version —
+    wire behavior is unaffected during a deprecation window (functional at least a
+    year, rolling per-version), but new implementations are told not to add support
+    for it, and the SEP's stated alternative is "integrate directly with LLM provider
+    APIs."
+  Both push the same direction: don't build new sampling call sites. Ghost already has
+  a non-deprecated, protocol-agnostic option in-tree — `ai.CLIClient` (subscription-
+  billed `claude -p` subprocess, no API key, works with or without an MCP session,
+  already the resolve/supersede fallback when no key is configured). It preserves the
+  independent-extraction property sampling gives `Extract` — the transcript slice and
+  instructions are supplied as CLI arguments to a freshly spawned process, not read
+  back from the calling model's own memory — at the cost of one process spawn per call
+  rather than one RPC.
 
 ---
 
