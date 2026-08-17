@@ -1,6 +1,6 @@
 # Autonomous memory creation: in-session transcript capture
 
-**Status:** Design approved (2026-08-17). Ready for implementation planning.
+**Status:** Revised 2026-08-17 — added client scope, sampling-migration sequencing, and one flagged open question; pending re-review of this revision.
 **Author:** Wayne (wcatz)
 **Builds on:** #297 "feat: autonomous memory lifecycle — auto reflect, supersede, and resolve"
 
@@ -30,7 +30,54 @@ Three concrete gaps:
 
 ---
 
-## 2. Core concept: the session's own model reads its own transcript
+## 2. Client scope
+
+This design is written entirely against Claude Code's own hook contract, not the MCP
+specification. The mechanism below depends on Claude-Code-specific stdin/stdout fields —
+`transcript_path`, `stop_hook_active`, `additionalContext`, `decision: "block"` — and on
+a brand-new `SessionEnd` event that only Claude Code fires. None of this is part of MCP
+itself; it is the same Claude Code extension surface the existing `SessionStart`/`Stop`
+hooks already use.
+
+This runs deeper than naming. `transcript_path` exists because Claude Code persists every
+session as a durable on-disk transcript and hands hooks its path — that durability is what
+lets `ghost_capture` extract independently of the calling model's own memory or diligence.
+A client without an equivalent durable, hook-delivered transcript has no substitute to
+drop in: the obvious-looking fix, having the calling model pass its own recent
+conversation as a tool argument instead of a file path, just re-creates "Model-driven
+notes" below under a different name — the model would be authoring that content from its
+own context rather than Ghost reading an independent record, the exact diligence problem
+this design exists to avoid. So this isn't an oversight to patch later; the design
+intentionally trades portability for independence from the calling model.
+
+Concretely, on opencode, Cursor, or any other MCP client, today:
+
+- `ghost_capture` is a normal MCP tool, registered and callable everywhere Ghost runs —
+  but nothing here nudges a non-Claude-Code model to call it, and there is no transcript
+  for it to read even if invoked manually.
+- The lifecycle spawns relocated to `SessionEnd` (below) do not run at all — `SessionEnd`
+  is a new Claude Code hook event with no MCP-standard equivalent.
+- Ghost's portable baseline is unaffected: tools/resources/prompts and the MCP
+  `Instructions` field keep working on every client regardless of this design.
+
+Two open dependencies worth investigating before assuming permanent Claude-Code-only
+status, neither of which this spec resolves:
+
+1. **Does the client support MCP sampling (`CreateMessage`) at all?** Not a new risk —
+   `ghost_resolve` already depends on this today, on every client, and whether it works
+   on anything other than Claude Code has never been verified. The new `Extract` method
+   (Components, below) simply inherits this existing, pre-existing unknown; see
+   Guardrails for the related synchronous-sampling concern.
+2. **Does the client expose any session-boundary or pre-continuation event Ghost could
+   hook into?** Unknown for opencode and others — not investigated here.
+
+Neither resolves to "no" — only "not attempted." If either turns out favorably for a
+given client, capture and the `SessionEnd` lifecycle could plausibly be ported; until
+then, read this as a Claude Code feature, not a Ghost-wide one.
+
+---
+
+## 3. Core concept: the session's own model reads its own transcript
 
 The pivotal constraint, discovered during research: **MCP sampling only sees what the
 server sends.** `ai.SamplingProvider.Classify` passes exactly `systemPrompt +
@@ -52,12 +99,12 @@ question: **neither** — capture per-turn so detail is never at risk.
 
 ---
 
-## 3. Mechanism
+## 4. Mechanism
 
-### 3.1 `ghost_capture` MCP tool
+### 4.1 `ghost_capture` MCP tool
 
 Signature: `ghost_capture(project_id, transcript_path?)`. `transcript_path` is optional;
-when omitted the tool reads the pending marker (see §3.3) for the latest session.
+when omitted the tool reads the pending marker (see §4.3) for the latest session.
 
 Flow:
 
@@ -87,7 +134,7 @@ Flow:
 8. **Commit.** Advance the capture cursor, clear the pending marker, and return a
    summary of saved vs proposed memories.
 
-### 3.2 Refined `Stop` hook
+### 4.2 Refined `Stop` hook
 
 When `capture.enabled`, `ghost hook stop` becomes:
 
@@ -111,7 +158,7 @@ still recorded nothing. Any save or capture clears the marker via step 4, resett
 cycle for the next burst of unrecorded work. The `stop_hook_active` guard plus Claude
 Code's 8-consecutive-continuation cap bound both mechanisms, exactly as today.
 
-### 3.3 `ghost hook session-end` (new event)
+### 4.3 `ghost hook session-end` (new event)
 
 New `SessionEnd` hook moves the lifecycle spawns off the per-turn `Stop` path:
 
@@ -125,7 +172,7 @@ New `SessionEnd` hook moves the lifecycle spawns off the per-turn `Stop` path:
   the lifecycle keeps its PID-file serialization and detached `--apply` semantics,
   unchanged.
 
-### 3.4 Config
+### 4.4 Config
 
 ```go
 type CaptureConfig struct {
@@ -139,9 +186,24 @@ type CaptureConfig struct {
 `reflection.auto_reflect` (default `false`) lands here per #297, completing the
 reflect/resolve/supersede trifecta on `SessionEnd`.
 
+**Open question: `capture.enabled` defaults to `true`, while everything else in this
+config defaults to `false`.** #297 established "opt-in, not opt-out" for `auto_resolve`,
+`auto_supersede`, and (per its own text) `auto_reflect` — all three spawn detached
+`--apply` processes that mutate existing memories headlessly. `capture.enabled`
+diverges: it's on by default even though it's the newer, less-proven mechanism. The case
+for keeping it on: capture is gated (confidence ≥ 0.8 and importance ≥ 0.5 to auto-save),
+routes everything below the gate to a proposal instead of a write, spends no Anthropic
+credits, and a capture feature that defaults off reproduces the exact "entirely on the
+assistant to remember" gap described in the Problem section for anyone who never finds
+the config key — arguably a different, lower risk profile than headless `--apply`
+lifecycle spawns. The case for flipping it to `false`: it's still new, unvalidated
+against real transcripts, and it's the one place this draft departs from an
+already-established project convention. Flagged for a decision rather than resolved
+here.
+
 ---
 
-## 4. Guardrails (hard)
+## 5. Guardrails (hard)
 
 - **Hooks do zero DB/LLM work.** The `Stop` hook writes a marker and emits text only.
   `SessionEnd` performs the same small read-only project lookup + detached spawn the
@@ -160,10 +222,17 @@ reflect/resolve/supersede trifecta on `SessionEnd`.
   concurrent foreground sessions in different projects race on it (last-writer-wins).
   The explicit `transcript_path` arg is the escape hatch. Acceptable for a single-user
   local tool — documented here rather than silently ignored.
+- **Sampling dependency, now doubled.** `Extract` reuses `Classify`'s synchronous
+  `CreateMessage` pattern — SEP-2322 will forbid exactly this pattern for clients that
+  negotiate newer MCP protocol versions, and `Extract`'s ~2000-token calls are a much
+  heavier, more latency-sensitive round-trip than `Classify`'s 16-token calls. This
+  design does not migrate to the async replacement; recommend doing that migration
+  first, or shaping `Extract` against the async pattern from the start, rather than
+  adding a second synchronous call site that needs the same rewrite later.
 
 ---
 
-## 5. Data flow
+## 6. Data flow
 
 ```
 Stop hook fires (per turn)
@@ -188,7 +257,7 @@ SessionEnd hook fires (once)
 
 ---
 
-## 6. Components & boundaries
+## 7. Components & boundaries
 
 | Unit | Purpose | Depends on |
 |---|---|---|
@@ -206,7 +275,7 @@ the tool handler against a fake sampler + seeded store (mirroring the existing
 
 ---
 
-## 7. Rejected alternatives
+## 8. Rejected alternatives
 
 - **`PreCompact` trigger** — the natural "save before you forget" point, but the event
   supports only `decision: "block"` (it discards `systemMessage`/`continue` and has no
@@ -220,13 +289,22 @@ the tool handler against a fake sampler + seeded store (mirroring the existing
 - **Model-driven notes** (`ghost_capture(notes=…)` where the model summarizes) — higher
   signal-to-noise but still depends on the model's diligence, defeating the autonomy
   goal. Transcript-driven was chosen.
+- **Client-agnostic transcript delivery** (`ghost_capture(transcript_text=…)` instead of
+  reading `transcript_path` server-side) — considered while scoping this design across
+  MCP clients. Rejected: the calling model would have to author or paste its own recent
+  conversation into the argument, which is mechanically the same thing as "Model-driven
+  notes" above — the model reporting on itself rather than Ghost reading an independent
+  record — plus it burns the calling model's own output tokens reproducing content it
+  already lived through. Durable, hook-delivered file access isn't an incidental
+  implementation choice; it's why this design gets independent extraction without
+  relying on the calling model's cooperation. See "Client scope" above.
 - **Daemon/cron for lifecycle** — out of scope; noted as future in #297.
 - **Keeping lifecycle on `Stop`** — per-turn prologue overhead is the bug this design
   fixes; `SessionEnd` is the semantically correct event.
 
 ---
 
-## 8. Testing
+## 9. Testing
 
 - **Capture package** — fixture transcript: bounding at `max_transcript_bytes`, cursor
   resume across calls, tool-result elision, prompt construction, JSON parse, category/
@@ -240,4 +318,7 @@ the tool handler against a fake sampler + seeded store (mirroring the existing
   matching project.
 - **Config** — `capture.*` defaults (`enabled=true`, thresholds 0.8/0.5); `auto_reflect`
   default `false`.
+- **Sampling capability absent or unresponsive** — a live session exists but the client
+  doesn't implement `CreateMessage`, or the call times out: `ghost_capture` returns a
+  clear error and never blocks or silently retries.
 - `go vet ./...` before commit; feature branch + PR.
