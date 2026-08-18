@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2184,6 +2186,456 @@ func TestMergeProject_SameID(t *testing.T) {
 
 	if err := s.MergeProject(ctx, testProject, testProject); err != nil {
 		t.Fatalf("MergeProject same ID should be no-op: %v", err)
+	}
+}
+
+// seedFullProject creates four memories, four memory-link pairs, two tasks,
+// one decision (which also creates its own linked memory row,
+// source='decision_log', bringing the memory total to 5), three token_usage
+// rows, and six audit_log rows for projectID — a row in every table
+// DeleteProject must account for, with every field's final count (memories=5,
+// memory_links=4, tasks=2, decisions=1, token_usage=3, audit_log=6) distinct
+// from every other field's, so a test that transposes any pair of scan
+// targets in DeleteProject's count query fails instead of passing silently.
+// Returns the first two linked memory IDs.
+func seedFullProject(t *testing.T, s *Store, ctx context.Context, projectID string) (mem1, mem2 string) {
+	t.Helper()
+
+	var err error
+	mem1, err = s.Create(ctx, projectID, Memory{
+		Category: "fact", Content: "seed memory one", Source: "manual", Importance: 0.5, Tags: []string{},
+	})
+	if err != nil {
+		t.Fatalf("seed mem1: %v", err)
+	}
+	mem2, err = s.Create(ctx, projectID, Memory{
+		Category: "fact", Content: "seed memory two", Source: "manual", Importance: 0.5, Tags: []string{},
+	})
+	if err != nil {
+		t.Fatalf("seed mem2: %v", err)
+	}
+	mem3, err := s.Create(ctx, projectID, Memory{
+		Category: "fact", Content: "seed memory three", Source: "manual", Importance: 0.5, Tags: []string{},
+	})
+	if err != nil {
+		t.Fatalf("seed mem3: %v", err)
+	}
+	mem4, err := s.Create(ctx, projectID, Memory{
+		Category: "fact", Content: "seed memory four", Source: "manual", Importance: 0.5, Tags: []string{},
+	})
+	if err != nil {
+		t.Fatalf("seed mem4: %v", err)
+	}
+	for _, pair := range [][2]string{{mem1, mem2}, {mem1, mem3}, {mem1, mem4}, {mem2, mem3}} {
+		if err := s.CreateLink(ctx, pair[0], pair[1], "related", 0.8, "auto"); err != nil {
+			t.Fatalf("seed link %v: %v", pair, err)
+		}
+	}
+	if _, err := s.CreateTask(ctx, projectID, "seed task one", "desc", 1); err != nil {
+		t.Fatalf("seed task one: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, projectID, "seed task two", "desc", 1); err != nil {
+		t.Fatalf("seed task two: %v", err)
+	}
+	if _, _, err := s.RecordDecision(ctx, projectID, "seed decision", "did the thing", "because", nil, nil); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.RecordUsage(ctx, projectID, "claude-opus-4-6", TokenUsage{InputTokens: 10, OutputTokens: 5}); err != nil {
+			t.Fatalf("seed token_usage %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 6; i++ {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO audit_log (action, project_id) VALUES ('test-action', ?)`, projectID,
+		); err != nil {
+			t.Fatalf("seed audit_log %d: %v", i, err)
+		}
+	}
+	return mem1, mem2
+}
+
+// countRows returns the number of rows in table matching a project_id column,
+// queried directly so the assertion doesn't depend on DeleteProject's own
+// counting logic being correct.
+func countRows(t *testing.T, s *Store, table, projectID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM `+table+` WHERE project_id = ?`, projectID).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+func TestDeleteProject_NotFound(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	_, err := s.DeleteProject(ctx, "no-such-project", false)
+	if err == nil {
+		t.Fatal("expected error for nonexistent project")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected %q in error, got: %v", "not found", err)
+	}
+}
+
+func TestDeleteProject_RefusesGlobal(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.SeedGlobalMemories(ctx); err != nil {
+		t.Fatalf("SeedGlobalMemories: %v", err)
+	}
+
+	for _, apply := range []bool{false, true} {
+		_, err := s.DeleteProject(ctx, "_global", apply)
+		if err == nil {
+			t.Fatalf("expected error deleting _global (apply=%v)", apply)
+		}
+	}
+
+	// The seeded global preference must have survived both attempts.
+	mems, err := s.GetAll(ctx, "_global", 100)
+	if err != nil {
+		t.Fatalf("GetAll _global: %v", err)
+	}
+	if len(mems) == 0 {
+		t.Error("expected _global memories to survive refused delete attempts")
+	}
+}
+
+func TestDeleteProject_DryRunCountsAndWritesNothing(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	seedFullProject(t, s, ctx, testProject)
+
+	summary, err := s.DeleteProject(ctx, testProject, false)
+	if err != nil {
+		t.Fatalf("DeleteProject dry-run: %v", err)
+	}
+
+	if summary.ProjectID != testProject {
+		t.Errorf("ProjectID = %q, want %q", summary.ProjectID, testProject)
+	}
+	// 5 memories: the 4 seeded directly + 1 from RecordDecision's decision_log row.
+	if summary.Memories != 5 {
+		t.Errorf("Memories = %d, want 5", summary.Memories)
+	}
+	if summary.MemoryLinks != 4 {
+		t.Errorf("MemoryLinks = %d, want 4", summary.MemoryLinks)
+	}
+	if summary.Tasks != 2 {
+		t.Errorf("Tasks = %d, want 2", summary.Tasks)
+	}
+	if summary.Decisions != 1 {
+		t.Errorf("Decisions = %d, want 1", summary.Decisions)
+	}
+	if summary.TokenUsage != 3 {
+		t.Errorf("TokenUsage = %d, want 3", summary.TokenUsage)
+	}
+	if summary.AuditLog != 6 {
+		t.Errorf("AuditLog = %d, want 6", summary.AuditLog)
+	}
+
+	// Dry-run must write nothing: every row must still be there.
+	if n := countRows(t, s, "memories", testProject); n != 5 {
+		t.Errorf("memories after dry-run = %d, want 5 (unchanged)", n)
+	}
+	if n := countRows(t, s, "tasks", testProject); n != 2 {
+		t.Errorf("tasks after dry-run = %d, want 2 (unchanged)", n)
+	}
+	if n := countRows(t, s, "token_usage", testProject); n != 3 {
+		t.Errorf("token_usage after dry-run = %d, want 3 (unchanged)", n)
+	}
+	if _, _, err := s.ResolveProject(ctx, testProject); err != nil {
+		t.Fatalf("ResolveProject after dry-run: %v", err)
+	}
+}
+
+func TestDeleteProject_ApplyRemovesEverythingIncludingOrphanTables(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	mem1, _ := seedFullProject(t, s, ctx, testProject)
+
+	// Seed one row in every remaining cascading table seedFullProject
+	// doesn't already cover, so this test proves the full cascade chain
+	// documented on DeleteProject, not just the tables exercised elsewhere.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO memory_embeddings (memory_id, embedding) VALUES (?, ?)`, mem1, []byte{0x01, 0x02},
+	); err != nil {
+		t.Fatalf("seed memory_embeddings: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO link_scans (memory_id) VALUES (?)`, mem1,
+	); err != nil {
+		t.Fatalf("seed link_scans: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO ghost_state (project_id, learned_context) VALUES (?, ?)
+		 ON CONFLICT(project_id) DO UPDATE SET learned_context = excluded.learned_context`,
+		testProject, "seeded learned context",
+	); err != nil {
+		t.Fatalf("seed ghost_state: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO memory_snapshots (snapshot_id, project_id, category, content, importance, source) VALUES (?, ?, ?, ?, ?, ?)`,
+		"snap-1", testProject, "fact", "seed snapshot content", 0.5, "manual",
+	); err != nil {
+		t.Fatalf("seed memory_snapshots: %v", err)
+	}
+	const seedConversationID = "conv-1"
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversations (id, project_id) VALUES (?, ?)`, seedConversationID, testProject,
+	); err != nil {
+		t.Fatalf("seed conversations: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)`, seedConversationID, "user", "seed message",
+	); err != nil {
+		t.Fatalf("seed messages: %v", err)
+	}
+
+	summary, err := s.DeleteProject(ctx, testProject, true)
+	if err != nil {
+		t.Fatalf("DeleteProject apply: %v", err)
+	}
+	if summary.Memories != 5 || summary.MemoryLinks != 4 || summary.Tasks != 2 ||
+		summary.Decisions != 1 || summary.TokenUsage != 3 || summary.AuditLog != 6 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+
+	for _, table := range []string{"memories", "tasks", "decisions", "token_usage", "audit_log"} {
+		if n := countRows(t, s, table, testProject); n != 0 {
+			t.Errorf("%s after apply = %d, want 0", table, n)
+		}
+	}
+	var linkCount int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM memory_links
+		WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)
+	`).Scan(&linkCount); err != nil {
+		t.Fatalf("check dangling links: %v", err)
+	}
+	if linkCount != 0 {
+		t.Errorf("expected no dangling memory_links pointing at deleted memories, got %d", linkCount)
+	}
+
+	// The memories_fts index (maintained by the memories_ad AFTER DELETE
+	// trigger in schema.go) must also be emptied by the cascade delete —
+	// it has no project_id column, so countRows can't check it directly.
+	var ftsCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM memories_fts`).Scan(&ftsCount); err != nil {
+		t.Fatalf("count memories_fts: %v", err)
+	}
+	if ftsCount != 0 {
+		t.Errorf("memories_fts retains %d rows after apply, want 0", ftsCount)
+	}
+
+	// memory_embeddings and link_scans key off memory_id, not project_id, so
+	// countRows can't check them directly.
+	var embedCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM memory_embeddings WHERE memory_id = ?`, mem1).Scan(&embedCount); err != nil {
+		t.Fatalf("count memory_embeddings: %v", err)
+	}
+	if embedCount != 0 {
+		t.Errorf("memory_embeddings retains %d rows after apply, want 0", embedCount)
+	}
+	var scanCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM link_scans WHERE memory_id = ?`, mem1).Scan(&scanCount); err != nil {
+		t.Fatalf("count link_scans: %v", err)
+	}
+	if scanCount != 0 {
+		t.Errorf("link_scans retains %d rows after apply, want 0", scanCount)
+	}
+
+	for _, table := range []string{"ghost_state", "memory_snapshots", "conversations"} {
+		if n := countRows(t, s, table, testProject); n != 0 {
+			t.Errorf("%s after apply = %d, want 0", table, n)
+		}
+	}
+	// messages keys off conversation_id, not project_id.
+	var msgCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE conversation_id = ?`, seedConversationID).Scan(&msgCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if msgCount != 0 {
+		t.Errorf("messages retains %d rows after apply, want 0", msgCount)
+	}
+
+	// The project row itself is gone.
+	id, _, err := s.ResolveProject(ctx, testProject)
+	if err != nil {
+		t.Fatalf("ResolveProject after apply: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected project to be gone, ResolveProject still returns id %q", id)
+	}
+}
+
+func TestDeleteProject_IsolatesOtherProjects(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	const otherProject = "other-project"
+	if err := s.EnsureProject(ctx, otherProject, "/tmp/other-project", "other-project"); err != nil {
+		t.Fatalf("EnsureProject other: %v", err)
+	}
+
+	seedFullProject(t, s, ctx, testProject)
+	seedFullProject(t, s, ctx, otherProject)
+
+	if _, err := s.DeleteProject(ctx, testProject, true); err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	expected := map[string]int{"memories": 5, "tasks": 2, "decisions": 1, "token_usage": 3, "audit_log": 6}
+	for table, want := range expected {
+		if n := countRows(t, s, table, otherProject); n != want {
+			t.Errorf("%s for %s after deleting %s = %d, want %d (should be untouched)", table, otherProject, testProject, n, want)
+		}
+	}
+
+	var links int
+	if err := s.db.QueryRow(`
+		SELECT count(*) FROM memory_links l
+		JOIN memories m ON m.id = l.source_id
+		WHERE m.project_id = ?`, otherProject).Scan(&links); err != nil {
+		t.Fatalf("count memory_links: %v", err)
+	}
+	if links != 4 {
+		t.Errorf("memory_links for %s = %d, want 4", otherProject, links)
+	}
+
+	if id, _, err := s.ResolveProject(ctx, otherProject); err != nil || id == "" {
+		t.Errorf("expected %s to still exist, ResolveProject: id=%q err=%v", otherProject, id, err)
+	}
+}
+
+// TestDeleteProjectRowTx_AlreadyDeletedGuard exercises deleteProjectRowTx
+// directly rather than the full DeleteProject method. DeleteProject holds
+// s.mu for its entire apply path (count queries through the final delete),
+// so within a single process two calls to s.DeleteProject can't interleave —
+// the race this guard defends against is ResolveProject (which takes its own
+// RLock and releases it) reporting the project as present, and the row then
+// vanishing before this transaction's DELETE runs: a concurrent caller in
+// this process racing the window between ResolveProject and s.mu.Lock(), or
+// — the realistic case — a separate ghost process (CLI and MCP server each
+// open their own *Store against the same SQLite file) deleting it via its
+// own connection. Reproducing that with real timing would be flaky; deleting
+// the row directly via s.db and then invoking the exact helper DeleteProject
+// calls proves the guard fires without relying on goroutine scheduling.
+func TestDeleteProjectRowTx_AlreadyDeletedGuard(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Simulate a concurrent deletion that already removed the project row
+	// before this transaction's delete runs. This must happen before
+	// BeginTx below: the store's *sql.DB is capped at one open connection
+	// (SetMaxOpenConns(1), see schema.go OpenDB) to serialize SQLite access,
+	// so issuing this DELETE against s.db while a tx already holds that sole
+	// connection would block forever waiting for a connection that can never
+	// free up.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, testProject); err != nil {
+		t.Fatalf("pre-delete project: %v", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	err = deleteProjectRowTx(ctx, tx, testProject)
+	if err == nil {
+		t.Fatal("expected error when project row is already gone")
+	}
+	if !strings.Contains(err.Error(), "already deleted") {
+		t.Errorf("expected %q in error, got: %v", "already deleted", err)
+	}
+}
+
+// TestDeleteProject_ConcurrentWriteFromSeparateProcessDoesNotUndercountSummary
+// exercises the race DeleteProject's write-lock-first ordering exists to
+// close: two separate *Store instances (simulating two separate ghost
+// processes, e.g. a CLI `project delete --apply` and a long-running MCP
+// server) opened against the same on-disk SQLite file — :memory: databases
+// aren't shared across handles, so this needs a real temp file. One store
+// races a write against the project the other is deleting. Whichever side
+// wins, the returned summary must never lie about what was actually deleted.
+func TestDeleteProject_ConcurrentWriteFromSeparateProcessDoesNotUndercountSummary(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "race.sqlite")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	dbA, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB A: %v", err)
+	}
+	defer func() { _ = dbA.Close() }()
+	storeA := NewStore(dbA, logger)
+
+	dbB, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB B: %v", err)
+	}
+	defer func() { _ = dbB.Close() }()
+	storeB := NewStore(dbB, logger)
+
+	ctx := context.Background()
+	if err := storeA.EnsureProject(ctx, testProject, "/tmp/race", testProject); err != nil {
+		t.Fatalf("EnsureProject: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var bErr error
+	var bSucceeded bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Retry briefly: the first attempt or two may land before storeA
+		// even starts its transaction, or may block on storeA's held write
+		// lock until it commits or rolls back.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_, _, _, upsertErr := storeB.Upsert(ctx, testProject, "fact", "racing write from a second process", "manual", 0.5, []string{})
+			if upsertErr == nil {
+				bSucceeded = true
+				return
+			}
+			bErr = upsertErr
+			if strings.Contains(upsertErr.Error(), "FOREIGN KEY") {
+				// The project is already gone — a definitive loss, not a
+				// transient lock contention. Stop retrying.
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	summary, err := storeA.DeleteProject(ctx, testProject, true)
+	wg.Wait()
+
+	if err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	// The invariant this test protects: the summary must never undercount
+	// what actually got deleted. If B's write landed before A's count ran
+	// (bSucceeded), A's count — taken only after the write lock is forced —
+	// must have seen it; if B's write never landed, the count must be 0.
+	if bSucceeded && summary.Memories != 1 {
+		t.Errorf("B's concurrent write succeeded but summary.Memories = %d, want 1 (undercounted)", summary.Memories)
+	}
+	if !bSucceeded && summary.Memories != 0 {
+		t.Errorf("B's concurrent write did not succeed (last err=%v) but summary.Memories = %d, want 0", bErr, summary.Memories)
+	}
+
+	// Whichever side won, the DB must end up fully consistent: no memories
+	// left over under a project that no longer exists.
+	var remaining int
+	if err := dbA.QueryRowContext(ctx, `SELECT count(*) FROM memories WHERE project_id = ?`, testProject).Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("expected 0 memories remaining for deleted project, got %d", remaining)
 	}
 }
 

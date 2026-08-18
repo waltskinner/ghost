@@ -1853,3 +1853,304 @@ func TestProjectTasksResource_ShortTaskID(t *testing.T) {
 		t.Errorf("expected output to contain the short task id `abc`, got: %s", result.Contents[0].Text)
 	}
 }
+
+func TestGhostProjectDelete_DryRunByDefault(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+	session := connectedClient(t, srv)
+
+	ctx := context.Background()
+	var memIDs []string
+	for i := 0; i < 4; i++ {
+		id, err := store.Create(ctx, "abc123", memory.Memory{
+			Category: "fact", Content: "seed memory for delete test", Source: "manual", Importance: 0.5, Tags: []string{},
+		})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		memIDs = append(memIDs, id)
+	}
+	// Seed memory_links, tasks, decisions, and token_usage too, not just
+	// memories, with mutually distinct counts (memories=5 [4 seeded here + 1
+	// from RecordDecision's decision_log row], memory_links=3, tasks=2,
+	// decisions=1, token_usage=4) so a swap of any pair of summary fields in
+	// the tool's output formatting would be caught here the same way the
+	// store-layer mutation test catches a TokenUsage/AuditLog swap.
+	// audit_log can't be seeded from this package (no exported production API
+	// writes it outside internal/memory), so it stays at its default 0 — but
+	// seeding a nonzero decisions count leaves 0 distinct from all five
+	// seeded fields too, so the assertion below still catches a transposition
+	// involving audit_log.
+	for _, pair := range [][2]string{{memIDs[0], memIDs[1]}, {memIDs[0], memIDs[2]}, {memIDs[1], memIDs[2]}} {
+		if err := store.CreateLink(ctx, pair[0], pair[1], "related", 0.8, "auto"); err != nil {
+			t.Fatalf("CreateLink %v: %v", pair, err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if err := store.RecordUsage(ctx, "abc123", "claude-opus-4-6", memory.TokenUsage{InputTokens: 10, OutputTokens: 5}); err != nil {
+			t.Fatalf("RecordUsage %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := store.CreateTask(ctx, "abc123", "Fix the bug", "needs triage", 1); err != nil {
+			t.Fatalf("CreateTask %d: %v", i, err)
+		}
+	}
+	if _, _, err := store.RecordDecision(ctx, "abc123", "seed decision", "did the thing", "because", nil, nil); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_project_delete",
+		Arguments: map[string]any{"project": "test-project"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ghost_project_delete: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got error result: %+v", result.Content)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected TextContent, got %T", result.Content[0])
+	}
+	if !strings.Contains(text.Text, "Would delete") {
+		t.Errorf("expected dry-run framing %q in response, got %q", "Would delete", text.Text)
+	}
+	if !strings.Contains(text.Text, "memories:     5") {
+		t.Errorf("expected summary line %q in response, got %q", "memories:     5", text.Text)
+	}
+	if !strings.Contains(text.Text, "memory_links: 3") {
+		t.Errorf("expected summary line %q in response, got %q", "memory_links: 3", text.Text)
+	}
+	if !strings.Contains(text.Text, "tasks:        2") {
+		t.Errorf("expected summary line %q in response, got %q", "tasks:        2", text.Text)
+	}
+	if !strings.Contains(text.Text, "decisions:    1") {
+		t.Errorf("expected summary line %q in response, got %q", "decisions:    1", text.Text)
+	}
+	if !strings.Contains(text.Text, "token_usage:  4") {
+		t.Errorf("expected summary line %q in response, got %q", "token_usage:  4", text.Text)
+	}
+	if !strings.Contains(text.Text, "audit_log:    0") {
+		t.Errorf("expected summary line %q in response, got %q", "audit_log:    0", text.Text)
+	}
+
+	all, err := store.GetAll(ctx, "abc123", 100)
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+	if len(all) != 5 {
+		t.Errorf("expected memories to survive dry-run, got %d memories", len(all))
+	}
+}
+
+func TestGhostProjectDelete_ApplyRemovesProject(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+	session := connectedClient(t, srv)
+
+	ctx := context.Background()
+	if _, err := store.Create(ctx, "abc123", memory.Memory{
+		Category: "fact", Content: "will this survive apply", Source: "manual", Importance: 0.5, Tags: []string{},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_project_delete",
+		Arguments: map[string]any{"project": "test-project", "apply": true},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ghost_project_delete: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got error result: %+v", result.Content)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected TextContent, got %T", result.Content[0])
+	}
+	if !strings.Contains(text.Text, "Deleted") {
+		t.Errorf("expected apply framing %q in response, got %q", "Deleted", text.Text)
+	}
+	if !strings.Contains(text.Text, "memories:     1") {
+		t.Errorf("expected summary line %q in response, got %q", "memories:     1", text.Text)
+	}
+
+	id, _, err := store.ResolveProject(ctx, "test-project")
+	if err != nil {
+		t.Fatalf("ResolveProject: %v", err)
+	}
+	if id != "" {
+		t.Error("expected project to be gone after apply")
+	}
+}
+
+func TestGhostProjectDelete_RejectsGlobal(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+	session := connectedClient(t, srv)
+	ctx := context.Background()
+	if err := store.SeedGlobalMemories(ctx); err != nil {
+		t.Fatalf("SeedGlobalMemories: %v", err)
+	}
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_project_delete",
+		Arguments: map[string]any{"project": "_global", "apply": true},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ghost_project_delete: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected an error result deleting _global, got success")
+	}
+}
+
+func TestGhostProjectDelete_NotifiesSubscribersOnApply(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+
+	ctx := context.Background()
+	if _, err := store.Create(ctx, "abc123", memory.Memory{
+		Category: "fact", Content: "subscriber should hear about this deletion", Source: "manual", Importance: 0.5, Tags: []string{},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	if _, err := srv.mcp.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatalf("server Connect: %v", err)
+	}
+
+	updated := make(chan string, 8)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ResourceUpdatedHandler: func(ctx context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			updated <- req.Params.URI
+		},
+	})
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	const contextURI = "ghost://project/test-project/context"
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: contextURI}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	const tasksURI = "ghost://project/test-project/tasks"
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: tasksURI}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	const decisionsURI = "ghost://project/test-project/decisions"
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: decisionsURI}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Subscribe's response only confirms the client's request round-trip
+	// completed; it races the server's own internal bookkeeping (see the
+	// identical note on TestResourceSubscription_NotifiesOnMemorySave).
+	// The deletion notifications below are emitted exactly once and can't
+	// be retried, so confirm each subscription actually registered — and
+	// drain these probe notifications — before triggering the real delete.
+	for _, uri := range []string{contextURI, tasksURI, decisionsURI} {
+		var seen bool
+		for attempt := 0; attempt < 10 && !seen; attempt++ {
+			srv.notifyResourceUpdated(ctx, uri)
+			select {
+			case <-updated:
+				seen = true
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if !seen {
+			t.Fatalf("subscription for %q never registered", uri)
+		}
+	}
+	for drained := true; drained; {
+		select {
+		case <-updated:
+		default:
+			drained = false
+		}
+	}
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_project_delete",
+		Arguments: map[string]any{"project": "test-project", "apply": true},
+	}); err != nil {
+		t.Fatalf("CallTool ghost_project_delete: %v", err)
+	}
+
+	want := map[string]bool{contextURI: false, tasksURI: false, decisionsURI: false}
+	deadline := time.After(2 * time.Second)
+	for remaining := len(want); remaining > 0; {
+		select {
+		case got := <-updated:
+			if seen, ok := want[got]; !ok {
+				t.Errorf("notified unexpected URI %q", got)
+			} else if seen {
+				// Duplicate notification for the same URI; ignore.
+			} else {
+				want[got] = true
+				remaining--
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for notifications, still missing: %+v", want)
+		}
+	}
+}
+
+func TestGhostProjectDelete_DryRunDoesNotNotify(t *testing.T) {
+	store := testStore(t)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := New(store, logger, "test")
+
+	ctx := context.Background()
+	if _, err := store.Create(ctx, "abc123", memory.Memory{
+		Category: "fact", Content: "dry run must not notify anyone", Source: "manual", Importance: 0.5, Tags: []string{},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	if _, err := srv.mcp.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatalf("server Connect: %v", err)
+	}
+
+	updated := make(chan string, 8)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ResourceUpdatedHandler: func(ctx context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			updated <- req.Params.URI
+		},
+	})
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	const contextURI = "ghost://project/test-project/context"
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: contextURI}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ghost_project_delete",
+		Arguments: map[string]any{"project": "test-project"},
+	}); err != nil {
+		t.Fatalf("CallTool ghost_project_delete: %v", err)
+	}
+
+	select {
+	case got := <-updated:
+		t.Fatalf("expected no notification on dry-run, got %q", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
