@@ -72,18 +72,47 @@ def get_key(provider):
              "~/.config/ghost/config.yaml")
 
 
+def get_key_openai_compat():
+    """Get API key for OpenAI-compatible providers (OpenCode Go, etc.)."""
+    for var in ("OPENCODE_API_KEY", "ZEN_API_KEY", "OPENAI_API_KEY"):
+        k = os.environ.get(var)
+        if k:
+            return k
+    sys.exit("error: no API key found; set OPENCODE_API_KEY, ZEN_API_KEY, "
+             "or OPENAI_API_KEY")
+
+
 # --------------------------------------------------------------------------
 # HTTP with retry (stdlib only; no openai/anthropic SDK dependency)
 # --------------------------------------------------------------------------
-def _post(url, headers, body, max_retries=6):
+def _post(url, headers, body, max_retries=30):
     data = json.dumps(body).encode()
     for attempt in range(max_retries):
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        hdrs = {**headers, "User-Agent": "ghost-phase4-bench/1.0"}
+        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             status = e.code
+            if status == 429 and attempt < max_retries - 1:
+                try:
+                    detail = e.read().decode()
+                except Exception:
+                    detail = ""
+                # Parse GoUsageLimitError "Resets in Xmin"
+                import re as _re
+                m = _re.search(r"Resets in (\d+)min", detail)
+                if m:
+                    wait = int(m.group(1)) * 60
+                    sys.stderr.write(f"  rate limit: resets in {m.group(1)}min, "
+                                     f"sleeping {wait}s ({attempt + 1}/{max_retries})\n")
+                else:
+                    wait = min(2 ** attempt, 30)
+                    sys.stderr.write(f"  http 429, retry in {wait}s "
+                                     f"({attempt + 1}/{max_retries})\n")
+                time.sleep(wait)
+                continue
             if status in RETRY_STATUS and attempt < max_retries - 1:
                 wait = min(2 ** attempt, 30)
                 sys.stderr.write(f"  http {status}, retry in {wait}s "
@@ -107,14 +136,17 @@ def _post(url, headers, body, max_retries=6):
     raise RuntimeError("exhausted retries")
 
 
-def chat(provider, model, key, prompt, max_tokens):
+def chat(provider, model, key, prompt, max_tokens, api_base_url=None):
     """Single-user-message chat completion, temperature 0. Returns text."""
     if provider == "openai":
         body = {"model": model, "temperature": 0, "max_tokens": max_tokens, "n": 1,
                 "messages": [{"role": "user", "content": prompt}]}
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        out = _post("https://api.openai.com/v1/chat/completions", headers, body)
-        return out["choices"][0]["message"]["content"]
+        base = (api_base_url or "https://api.openai.com").rstrip("/")
+        out = _post(f"{base}/v1/chat/completions", headers, body)
+        msg = out["choices"][0]["message"]
+        # DeepSeek puts short answers in reasoning_content when max_tokens is tight
+        return msg.get("content") or msg.get("reasoning_content", "")
     # anthropic
     body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]}
@@ -160,7 +192,10 @@ def cmd_generate(args):
     tok = tiktoken.get_encoding("o200k_base")
     max_ret = args.model_max_length - GEN_LENGTH - RESERVE
 
-    key = get_key(args.provider)
+    if args.api_base_url:
+        key = get_key_openai_compat()
+    else:
+        key = get_key(args.provider)
     data = json.load(open(args.dataset))
     done = load_done(args.out)
     if done:
@@ -175,7 +210,8 @@ def cmd_generate(args):
             prompt = prepare_prompt(
                 entry, args.retriever_type, args.topk_context, args.useronly,
                 args.history_format, args.cot, tok, "openai", max_ret, "none")
-            answer = chat(args.provider, args.model, key, prompt, GEN_LENGTH).strip()
+            answer = chat(args.provider, args.model, key, prompt, GEN_LENGTH,
+                          api_base_url=args.api_base_url).strip()
             fout.write(json.dumps({"question_id": qid, "hypothesis": answer}) + "\n")
             fout.flush()
             n_done += 1
@@ -189,7 +225,10 @@ def cmd_generate(args):
 # --------------------------------------------------------------------------
 def cmd_judge(args):
     _, get_anscheck_prompt = import_official(args.longmemeval_src)
-    key = get_key(args.provider)
+    if args.api_base_url:
+        key = get_key_openai_compat()
+    else:
+        key = get_key(args.provider)
 
     meta = {e["question_id"]: e for e in json.load(open(args.dataset))}
     out_path = args.judged or (args.hyp + f".eval-results-{args.model}")
@@ -209,7 +248,8 @@ def cmd_judge(args):
             prompt = get_anscheck_prompt(
                 e["question_type"], e["question"], e["answer"], h["hypothesis"],
                 abstention=abstention)
-            resp = chat(args.provider, args.model, key, prompt, 10)
+            resp = chat(args.provider, args.model, key, prompt, 50,
+                        api_base_url=args.api_base_url)
             label = "yes" in resp.lower()
             fout.write(json.dumps({
                 "question_id": qid, "question_type": e["question_type"],
@@ -260,6 +300,9 @@ def main():
                        help="e.g. gpt-4o-2024-08-06 | claude-sonnet-5 | claude-opus-4-8")
         p.add_argument("--longmemeval-src",
                        help="LongMemEval repo src/ dir (or set $LONGMEMEVAL_SRC)")
+        p.add_argument("--api-base-url",
+                       help="Override API base URL for OpenAI-compatible providers "
+                            "(e.g. https://opencode.ai/zen/go)")
 
     g = sub.add_parser("generate", help="produce hypotheses JSONL")
     add_common(g)
