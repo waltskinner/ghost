@@ -1,6 +1,6 @@
 # Autonomous Reflect — Design
 
-**Status:** Draft for review (2026-08-19).
+**Status:** Implemented (2026-08-19).
 **Author:** Wayne
 **Builds on:** #297 "feat: autonomous memory lifecycle — auto reflect, supersede, and resolve"; #312 "fix(resolve): fall back to claude CLI when MCP sampling is unavailable".
 
@@ -84,25 +84,29 @@ client:
 ```go
 // CLIProvider reports the best available CLI backend and delegates to it.
 // It satisfies reflection's reflector interface and ai.Provider, so it drops in
-// wherever CLIClient is used today.
-type CLIProvider struct { backend backend }
+// wherever CLIClient is used today. The selected backend's name is stored on the
+// struct, not on the interface, so Name() reports which binary was resolved.
+type CLIProvider struct {
+    backend cliBackend
+    name    string
+}
 
-// backend is the narrow capability the two CLI clients share: a name plus the
-// exported Reflect/Classify shapes each already (or will) implement.
-type backend interface {
-    Name() string
+// cliBackend is the narrow capability the two CLI clients share: the exported
+// Reflect/Classify shapes each already implements.
+type cliBackend interface {
     Reflect(ctx context.Context, prompt string) (string, TokenUsage, error)
     Classify(ctx context.Context, systemPrompt, userContent string) (string, error)
 }
 
 func NewCLIProvider() *CLIProvider            // claude if on PATH, else opencode if on PATH, else unavailable
-func NewCLIProviderBackend(name string) ...   // explicit "claude" | "opencode", errors if absent
 ```
 
 `CLIProvider` implements `Reflect` (returns `TokenUsage{}`, like `CLIClient`, since
 subscription calls carry no per-token cost) and `Classify`. `OpenCodeClient.Classify`
 inlines `systemPrompt` into the message because `opencode run` has no
 `--system-prompt` flag — the same join `anthropicClient.Classify` already performs.
+Explicit backend selection is `--tier cli` / `--tier opencode`, which construct
+`NewCLIClient()` / `NewOpenCodeClient()` directly; the resolver is only for `auto`.
 
 `OpenCodeClient` and the resolver return an explicit "unavailable" signal when the
 binary is missing rather than erroring mid-call, so tier selection and the
@@ -177,10 +181,14 @@ tiers.
 - **Recursion isolation for the opencode subprocess.** The detached `ghost reflect`
   spawns `opencode run`; that subprocess must not load Ghost's own MCP server or
   hooks (which would open the same SQLite DB mid-consolidation or let the subprocess
-  model call ghost tools). The client runs with `--pure` (no plugins) and, if needed,
-  a minimal/neutral config directory; it never passes `--continue` or `--session`, so
-  no session context bleeds across runs. The exact isolation mechanism (flag vs.
-  minimal config dir vs. env var) is pinned down in the implementation plan.
+  model call ghost tools). `OpenCodeClient` achieves this by: running with `--pure`
+  (no plugins); setting `cmd.Dir` to a neutral temp dir (no repo CLAUDE.md/git
+  context or project config); and pointing `XDG_CONFIG_HOME` at a fresh empty dir so
+  the user's global opencode config — which declares the Ghost MCP server — never
+  loads. It also strips `ANTHROPIC_API_KEY` (parity with `CLIClient`) and never passes
+  `--continue`/`--session`. Trade-off: the child runs on opencode's built-in default
+  model rather than the user's configured `model` key; acceptable for consolidation,
+  and worth revisiting if a model override is ever wanted.
 - **Opt-in destructive write.** `auto_reflect` defaults to `false`; the `--apply` it
   spawns runs `ReplaceNonManual`, the same destructive replace resolve/supersede
   already gate behind opt-in config. Pinned and manual memories are excluded by the
