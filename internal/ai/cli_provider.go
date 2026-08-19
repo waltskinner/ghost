@@ -27,8 +27,26 @@ type CLIProvider struct {
 // NewCLIProvider picks the best backend available on PATH: claude if present,
 // else opencode if present, else an unavailable provider.
 func NewCLIProvider() *CLIProvider {
+	return NewCLIProviderWithBinaries("", "")
+}
+
+// NewCLIProviderWithBinaries is NewCLIProvider with explicit binary paths.
+// claudeBinary/opencodeBinary override the PATH lookup when set (and resolvable),
+// so a binary installed outside the current process's PATH still wins; an empty
+// value falls back to the PATH lookup for that backend.
+func NewCLIProviderWithBinaries(claudeBinary, opencodeBinary string) *CLIProvider {
+	if claudeBinary != "" {
+		if _, err := exec.LookPath(claudeBinary); err == nil {
+			return &CLIProvider{backend: NewCLIClientWithBinary(claudeBinary), name: "cli"}
+		}
+	}
 	if _, err := exec.LookPath("claude"); err == nil {
 		return &CLIProvider{backend: NewCLIClient(), name: "cli"}
+	}
+	if opencodeBinary != "" {
+		if _, err := exec.LookPath(opencodeBinary); err == nil {
+			return &CLIProvider{backend: NewOpenCodeClientWithBinary(opencodeBinary), name: "opencode"}
+		}
 	}
 	if _, err := exec.LookPath("opencode"); err == nil {
 		return &CLIProvider{backend: NewOpenCodeClient(), name: "opencode"}

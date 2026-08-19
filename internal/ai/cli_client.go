@@ -37,7 +37,13 @@ type CLIClient struct {
 
 // NewCLIClient creates a CLIClient that invokes the `claude` binary on PATH.
 func NewCLIClient() *CLIClient {
-	return &CLIClient{binary: "claude"}
+	return NewCLIClientWithBinary("claude")
+}
+
+// NewCLIClientWithBinary creates a CLIClient that invokes the given binary path
+// (absolute, or a name resolved from PATH).
+func NewCLIClientWithBinary(binary string) *CLIClient {
+	return &CLIClient{binary: binary}
 }
 
 // Reflect satisfies reflection's reflector interface (see

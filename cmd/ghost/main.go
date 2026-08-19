@@ -320,17 +320,25 @@ Flags:
 		client := ai.NewClient(cfg.API.Key, logger)
 		consolidator = reflection.NewHaikuConsolidator(client)
 	case "cli":
-		if _, err := exec.LookPath("claude"); err != nil {
-			fmt.Fprintln(os.Stderr, "error: cli tier requires the `claude` binary on PATH")
+		binary := "claude"
+		if cfg.CLI.ClaudeBinary != "" {
+			binary = cfg.CLI.ClaudeBinary
+		}
+		if _, err := exec.LookPath(binary); err != nil {
+			fmt.Fprintln(os.Stderr, "error: cli tier requires the `claude` binary on PATH (or set cli.claude_binary)")
 			os.Exit(1)
 		}
-		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClient(), "cli")
+		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClientWithBinary(binary), "cli")
 	case "opencode":
-		if _, err := exec.LookPath("opencode"); err != nil {
-			fmt.Fprintln(os.Stderr, "error: opencode tier requires the `opencode` binary on PATH")
+		binary := "opencode"
+		if cfg.CLI.OpenCodeBinary != "" {
+			binary = cfg.CLI.OpenCodeBinary
+		}
+		if _, err := exec.LookPath(binary); err != nil {
+			fmt.Fprintln(os.Stderr, "error: opencode tier requires the `opencode` binary on PATH (or set cli.opencode_binary)")
 			os.Exit(1)
 		}
-		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClient(), "opencode")
+		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClientWithBinary(binary), "opencode")
 	case "sqlite":
 		consolidator = reflection.NewSQLiteConsolidator()
 	default: // "auto"
@@ -339,7 +347,7 @@ Flags:
 			client := ai.NewClient(cfg.API.Key, logger)
 			tiers = append(tiers, reflection.NewHaikuConsolidator(client))
 		}
-		if cli := ai.NewCLIProvider(); cli.Available() {
+		if cli := ai.NewCLIProviderWithBinaries(cfg.CLI.ClaudeBinary, cfg.CLI.OpenCodeBinary); cli.Available() {
 			tiers = append(tiers, reflection.NewNamedConsolidator(cli, cli.Name()))
 		}
 		tiers = append(tiers, reflection.NewSQLiteConsolidator())

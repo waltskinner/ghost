@@ -23,7 +23,13 @@ type OpenCodeClient struct {
 
 // NewOpenCodeClient creates an OpenCodeClient that invokes `opencode` on PATH.
 func NewOpenCodeClient() *OpenCodeClient {
-	return &OpenCodeClient{binary: "opencode"}
+	return NewOpenCodeClientWithBinary("opencode")
+}
+
+// NewOpenCodeClientWithBinary creates an OpenCodeClient that invokes the given
+// binary path (absolute, or a name resolved from PATH).
+func NewOpenCodeClientWithBinary(binary string) *OpenCodeClient {
+	return &OpenCodeClient{binary: binary}
 }
 
 // Reflect satisfies reflection's reflector interface (see

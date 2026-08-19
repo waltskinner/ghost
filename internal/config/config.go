@@ -27,6 +27,7 @@ var exampleConfig []byte
 // Config holds the global ghost configuration.
 type Config struct {
 	API        APIConfig        `koanf:"api"`
+	CLI        CLIConfig        `koanf:"cli"`
 	Embedding  EmbeddingConfig  `koanf:"embedding"`
 	Reflection ReflectionConfig `koanf:"reflection"`
 	Linking    LinkingConfig    `koanf:"linking"`
@@ -36,6 +37,17 @@ type Config struct {
 // APIConfig holds Claude API settings (used by reflection only).
 type APIConfig struct {
 	Key string `koanf:"key"`
+}
+
+// CLIConfig holds explicit paths to the subprocess LLM binaries backing the
+// reflect CLI tier. An empty value means "resolve from PATH"; a set path
+// overrides PATH lookup. This matters for auto_reflect: the Stop hook process's
+// PATH is often not the interactive shell's, so a binary installed under
+// ~/.opencode/bin (or similar) is invisible to exec.LookPath unless its path is
+// configured explicitly here.
+type CLIConfig struct {
+	ClaudeBinary   string `koanf:"claude_binary"`
+	OpenCodeBinary string `koanf:"opencode_binary"`
 }
 
 // ReflectionConfig holds memory consolidation settings.
@@ -77,6 +89,8 @@ var defaults = map[string]interface{}{
 	"reflection.auto_resolve":    false,
 	"reflection.auto_supersede":  false,
 	"reflection.auto_reflect":    false,
+	"cli.claude_binary":          "",
+	"cli.opencode_binary":        "",
 	"linking.enabled":            true,
 	"linking.threshold":          0.70,
 	"linking.demotion_threshold": 0.90,

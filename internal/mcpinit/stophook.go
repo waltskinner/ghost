@@ -298,7 +298,7 @@ func spawnReflectIfConfigured(cwd string) {
 	if err != nil || !cfg.Reflection.AutoReflect {
 		return
 	}
-	if cfg.API.Key == "" && !ai.NewCLIProvider().Available() {
+	if cfg.API.Key == "" && !ai.NewCLIProviderWithBinaries(cfg.CLI.ClaudeBinary, cfg.CLI.OpenCodeBinary).Available() {
 		return
 	}
 

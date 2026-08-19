@@ -61,8 +61,10 @@ already exist.
 - No embedding improvement. Ollama is not running here, so embeddings are out of
   scope. The sqlite tier's token-overlap dedup IS improved in place (see §5) and
   remains the final fallback.
-- No new config surface beyond `reflection.auto_reflect`. Backend selection is
-  availability-driven (PATH), with explicit `--tier` overrides only.
+- No new config surface beyond `reflection.auto_reflect` and the two `cli.*`
+  binary-path overrides (`cli.claude_binary` / `cli.opencode_binary`). Backend
+  selection is availability-driven (PATH), with explicit `--tier` overrides and
+  the binary-path config for installs that aren't on the hook process's PATH.
 
 ## Design
 
@@ -124,6 +126,13 @@ The reflect command's tier switch gains an `opencode` case:
   opencode) if any CLI is on PATH, then sqlite as the always-available fallback.
 
 The usage string and any tier-name validation are updated to include `opencode`.
+
+Backend resolution honors two optional config keys — `cli.claude_binary` and
+`cli.opencode_binary` (both default empty = PATH lookup). When set, the explicit
+path wins over `exec.LookPath`, so a binary installed under `~/.opencode/bin`
+(or similar) is found even though that directory is not on the Stop hook
+process's PATH. This is what keeps `auto_reflect` from silently never firing on
+machines where the CLI lives only on the interactive shell's PATH.
 
 ### 3. `reflection.auto_reflect` (`internal/config/config.go`)
 
