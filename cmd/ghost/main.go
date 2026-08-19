@@ -287,7 +287,7 @@ func runReflect() {
 		fmt.Fprintln(os.Stderr, `Usage: ghost reflect <project> [flags]
 
 Flags:
-  --tier string   Consolidation tier: auto, haiku, cli, sqlite (default "auto")
+  --tier string   Consolidation tier: auto, haiku, cli, opencode, sqlite (default "auto")
   --apply         Save results (default is dry-run/preview only)
   --restore       Undo the last consolidation from snapshot`)
 		os.Exit(1)
@@ -325,6 +325,12 @@ Flags:
 			os.Exit(1)
 		}
 		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClient(), "cli")
+	case "opencode":
+		if _, err := exec.LookPath("opencode"); err != nil {
+			fmt.Fprintln(os.Stderr, "error: opencode tier requires the `opencode` binary on PATH")
+			os.Exit(1)
+		}
+		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClient(), "opencode")
 	case "sqlite":
 		consolidator = reflection.NewSQLiteConsolidator()
 	default: // "auto"
@@ -333,8 +339,8 @@ Flags:
 			client := ai.NewClient(cfg.API.Key, logger)
 			tiers = append(tiers, reflection.NewHaikuConsolidator(client))
 		}
-		if _, err := exec.LookPath("claude"); err == nil {
-			tiers = append(tiers, reflection.NewNamedConsolidator(ai.NewCLIClient(), "cli"))
+		if cli := ai.NewCLIProvider(); cli.Available() {
+			tiers = append(tiers, reflection.NewNamedConsolidator(cli, cli.Name()))
 		}
 		tiers = append(tiers, reflection.NewSQLiteConsolidator())
 		consolidator = reflection.NewTieredConsolidator(tiers, logger)
@@ -1094,15 +1100,16 @@ Commands:
   version                     Print version
 
 Flags (reflect):
-  --tier string   Consolidation tier: auto, haiku, cli, sqlite (default "auto")
+  --tier string   Consolidation tier: auto, haiku, cli, opencode, sqlite (default "auto")
   --apply         Save results
   --restore       Undo last consolidation
 
 Environment:
-  ANTHROPIC_API_KEY           Required for reflect --tier haiku. supersede/resolve and
-                              reflect --tier cli/auto fall back to a subscription-billed
-                              'claude' CLI call (requires the 'claude' binary on PATH)
-                              when unset or exhausted.
+  ANTHROPIC_API_KEY           Required for reflect --tier haiku. supersede/resolve fall
+                              back to a subscription-billed 'claude' CLI call (requires
+                              the 'claude' binary on PATH); reflect --tier
+                              cli/opencode/auto falls back to 'claude' or 'opencode'
+                              (whichever is on PATH). All when unset or exhausted.
   GHOST_DEBUG                 Enable debug logging
 `, version)
 }
