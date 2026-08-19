@@ -202,6 +202,14 @@ tiers.
   spawns runs `ReplaceNonManual`, the same destructive replace resolve/supersede
   already gate behind opt-in config. Pinned and manual memories are excluded by the
   #295 fix already in main.
+- **Resolved memories survive reflect (issue #318).** `ghost resolve --apply` de-weights
+  resolved-evidence memories via `resolved_at`; reflect must not undo that verdict.
+  `ReplaceNonManual`/`RestoreSnapshot` exclude `resolved_at IS NOT NULL` rows from their
+  delete/snapshot/preserve queries, and reflect drops resolved memories from its
+  consolidation input so the consolidator can't re-emit them as fresh unresolved
+  duplicates. Without this, the #297 lifecycle would compose incorrectly: the
+  reflect → resolve → supersede stop-hook ordering would clobber the previous
+  session's resolve before it re-ran.
 
 ## Data flow
 
