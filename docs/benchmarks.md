@@ -2,7 +2,7 @@
 
 This document is the methodology for publishing retrieval-quality numbers honestly. The guiding rule: **a score only exists if anyone can re-run the harness with one command** — fixed seeds, published judge prompts (where a judge is used at all), and per-question logs.
 
-**Status:** Phase 1 (LongMemEval-S retrieval) and Phase 2 (`ghost bench`) have shipped with published numbers below. Phase 3 (staleness suite) ships report-only in CI. Phase 4 (end-to-end retrieve→generate→judge) scaffolding has shipped; the paid full run is pending.
+**Status:** Phase 1 (LongMemEval-S retrieval), Phase 2 (`ghost bench`), and Phase 4 (end-to-end retrieve→generate→judge with DeepSeek v4 Pro) have shipped with published numbers below. Phase 3 (staleness suite) ships report-only in CI. The official GPT-4o leaderboard-comparable run has not been executed yet.
 
 ## Why these benchmarks and not others
 
@@ -104,16 +104,61 @@ The trap is untouched because its distractors are *not* supersession pairs — n
 
 **Consumption has now graduated; creation stays opt-in.** `DefaultSearchParams` ships `SupersedeDemote: true`, so production `SearchHybrid` / `SearchHybridAll` (i.e. `ghost_memory_search` and `ghost_search_all`, including their FTS-only fallbacks) consume `supersedes` links. Creation remains opt-in — links only exist if the user ran `ghost supersede --apply` — so the demote is still a hard no-op for anyone who has not asked for it, and the numbers above are what back the flip: staleness fresh-wins 0.4 → 1.0 with recency-trap correct-wins unchanged at 0.929. It was flipped because an eval run found the opposite failure: a memory the user had explicitly marked as replaced still outranked its replacement in live search. `TestProductionSearchDemotesSuperseded` (internal/memory) guards the production entry points; `SearchHybridParams` still takes explicit params for the sweep harness.
 
-## Phase 4 — end-to-end LongMemEval-S (retrieve → generate → judge)
+## Phase 4 — end-to-end LongMemEval-S (retrieve → generate → judge) — SHIPPED (DeepSeek v4 Pro)
 
-The scaffolding has **shipped** ([`bench/longmemeval/phase4/`](../bench/longmemeval/phase4/)); the paid full run has not been executed yet. The pipeline is four stages: Ghost retrieves (Go, `-retrieval-out ranked.jsonl`), `merge_retrieval.py` folds the ranking into the dataset, and `phase4_run.py` generates hypotheses then judges them. Generation prompt assembly (`prepare_prompt`) and the yes/no grading templates (`get_anscheck_prompt`) are imported **verbatim** from an upstream LongMemEval checkout — only the API client is swapped — so numbers stay reproducible against the published harness. Both stages are append-only and resume-safe. See the [phase4 README](../bench/longmemeval/phase4/README.md) for the full command sequence.
+The pipeline ([`bench/longmemeval/phase4/`](../bench/longmemeval/phase4/)) is four stages: Ghost retrieves (Go, `-retrieval-out ranked.jsonl`), `merge_retrieval.py` folds the ranking into the dataset, and `phase4_run.py` generates hypotheses then judges them. Generation prompt assembly (`prepare_prompt`) and the yes/no grading templates (`get_anscheck_prompt`) are imported **verbatim** from an upstream LongMemEval checkout — only the API client is swapped — so numbers stay reproducible against the published harness. Both stages are append-only and resume-safe. To reproduce any reported score, run the full pipeline:
+
+```bash
+# 1. Retrieve (Ghost Go harness)
+go run ./bench/longmemeval -data longmemeval_s_cleaned.json \
+    -condition hybrid -ollama http://localhost:11434 \
+    -embed-cache ~/.cache/ghost-bench/embed-cache.jsonl \
+    -retrieval-out ranked.jsonl
+
+# 2. Merge retrieval into dataset
+python bench/longmemeval/phase4/merge_retrieval.py \
+    --dataset longmemeval_s_cleaned.json --retrieval ranked.jsonl --out merged.json
+
+# 3. Generate hypotheses (DeepSeek v4 Pro shown; swap provider/model for other runs)
+python bench/longmemeval/phase4/phase4_run.py generate \
+    --provider openai --model deepseek-v4-pro --api-base-url https://api.deepseek.com/v1 \
+    --dataset merged.json --out hyp.jsonl
+
+# 4. Judge + report
+python bench/longmemeval/phase4/phase4_run.py judge \
+    --provider openai --model deepseek-v4-pro --api-base-url https://api.deepseek.com/v1 \
+    --dataset merged.json --hyp hyp.jsonl
+```
+
+See the [phase4 README](../bench/longmemeval/phase4/README.md) for full setup (LongMemEval checkout, API keys, cost estimates).
+
+Results (2026-08-18, DeepSeek v4 Pro as both generator and judge, 470 questions, `topk_context=5`, per-question logs committed):
+
+```text
+condition   accuracy
+hybrid      96.8% (455/470)
+fts-only    83.6% (393/470)
+```
+
+Per-category breakdown:
+
+| Question type | Hybrid | FTS-only | Delta |
+|---|---|---|---|
+| single-session-user (64) | 100.0% | 98.4% | +1.6pp |
+| single-session-assistant (56) | 98.2% | 67.9% | +30.3pp |
+| single-session-preference (30) | 96.7% | 80.0% | +16.7pp |
+| multi-session (121) | 92.6% | 72.7% | +19.9pp |
+| temporal-reasoning (127) | 97.6% | 88.2% | +9.4pp |
+| knowledge-update (72) | 98.6% | 94.4% | +4.2pp |
+
+Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness.
 
 Two backends are supported:
 
 - **`openai` with a gpt-4o generator + gpt-4o judge** — the official, leaderboard-comparable setup (`evaluate_qa.py`, `o200k_base`, temperature 0). Substituting a different judge makes numbers non-comparable, a known problem with some published scores. The generator dominates the score and must be stated prominently.
 - **`anthropic` (Claude generator/judge)** — **not** leaderboard-comparable; an internal "Ghost retrieval + Claude generation, Claude-judged" check. Same-family generator+judge carries a self-preference caveat (the official gpt-4o-judges-gpt-4o setup has the same property); a different strong judge (e.g. gen `claude-sonnet-5`, judge `claude-opus-4-8`) costs only a few dollars more since the judge emits ~10 tokens/question.
 
-Estimated cost at `topk_context=5` over the full 470 answerable questions: ~$20 (gpt-4o gen+judge) or ~$24 (claude-sonnet-5 gen+judge); Opus as *generator* is ~$116 and should be avoided. Use `cost_estimate.py` (no API calls) to re-anchor before spending. When the run executes: temperature 0, single deterministic run, per-case results JSON and full logs committed, an explicit note that the memory system never saw oracle context.
+Estimated cost at `topk_context=5` over the full 470 answerable questions: ~$20 (gpt-4o gen+judge) or ~$24 (claude-sonnet-5 gen+judge); Opus as *generator* is ~$116 and should be avoided. Use `cost_estimate.py` (no API calls) to re-anchor before spending. Temperature 0, single recorded run, per-case results JSON and full logs committed, an explicit note that the memory system never saw oracle context.
 
 Reference points, all judged with the official GPT-4o harness but with **different generators** (which dominate the score — compare within-generator only): Zep 71.2% and full-context 60.2% (GPT-4o generator); Mastra 94.87% (gpt-5-mini generator; 84.23% with GPT-4o); agentmemory 96.2% (Claude Opus 4.6 generator, temperature 0).
 
