@@ -58,8 +58,9 @@ already exist.
 - No `SessionEnd` hook. The capture spec proposes relocating the lifecycle spawns to a
   once-per-session event; this spec deliberately mirrors the existing Stop-hook pattern
   instead, and defers any relocation to that work.
-- No Jaccard / embedding improvement. Ollama is not running here, and the LLM tier is
-  the requested fix; the sqlite tier is unchanged and remains the final fallback.
+- No embedding improvement. Ollama is not running here, so embeddings are out of
+  scope. The sqlite tier's token-overlap dedup IS improved in place (see §5) and
+  remains the final fallback.
 - No new config surface beyond `reflection.auto_reflect`. Backend selection is
   availability-driven (PATH), with explicit `--tier` overrides only.
 
@@ -143,6 +144,29 @@ spawning (optionally logging one line to `reflect.log`). This keeps autonomous r
 from ever running a Jaccard-only `--apply` that would rewrite non-manual memories with
 no consolidation quality gained.
 
+### 5. Jaccard improvement (`internal/reflection/tier_sqlite.go`)
+
+The sqlite tier is the fallback when no LLM is available, so its dedup quality matters.
+The current Jaccard approach has three concrete weaknesses, each fixed in place:
+
+1. **Noisy tokens.** `tokenize` keeps filler words ("the", "for", "with", "and",
+   "is", …), which dilute the score on longer memories. Fix: drop a small stopword
+   set in `tokenize`.
+2. **Subset memories under-merge.** Jaccard is symmetric and length-sensitive, so a
+   short memory that is a strict subset of a longer one ("use SQLite" vs "use SQLite
+   for storage with FTS5") scores low and never merges. Fix: score by
+   `max(jaccard, containment)` where `containment = |A∩B| / min(|A|,|B|)` (overlap
+   coefficient), so a subsumed memory merges into its superset.
+3. **Numeric differences over-merge.** Two memories that differ only in a number
+   ("k3s runs Grafana on port 80" vs "… port 81") share enough non-numeric tokens to
+   cross the 0.5 threshold and get wrongly merged. Fix: block a merge when the
+   symmetric difference contains a purely-numeric token — a precise fact that differs
+   is a different fact.
+
+The merge threshold (0.5) and the same-category restriction are unchanged. This is a
+self-contained, dependency-free change with its own tests; it does not touch the LLM
+tiers.
+
 ## Guardrails
 
 - **Hooks do zero DB/LLM work inline.** The spawn does only the small read-only
@@ -193,6 +217,9 @@ Stop hook fires (per turn, Claude Code)
 - Reflect CLI — `--tier opencode` selects the opencode backend; `--tier auto` resolves
   to the expected tier given each availability combination; a dry-run e2e with a fake
   opencode binary returns parsed memories without writing.
+- Jaccard improvement — stopword tokens are excluded from `tokenize`; a strict-subset
+  memory merges into its superset via the containment score; two memories differing
+  only in a numeric token do not merge; existing dedup tests still pass unchanged.
 - `go vet ./...` and `go test ./...` before and after, feature branch + PR.
 
 ## Rejected alternatives
@@ -203,9 +230,9 @@ Stop hook fires (per turn, Claude Code)
 - **Config-driven backend selection (`reflection.llm: claude|opencode|auto`).**
   Rejected — availability on PATH is enough; an extra key is surface to manage for no
   gain, and `--tier` already provides explicit override when needed.
-- **Improve Jaccard instead (embeddings/minhash).** Rejected for this pass — Ollama
-  isn't running here, and the requested fix is an LLM, not a better heuristic. The
-  sqlite tier remains the final fallback unchanged.
+- **Embedding-based dedup instead of token overlap.** Rejected — Ollama isn't running
+  here, and embeddings are a heavier, config-dependent change than the LLM tier this
+  spec adds. The token-overlap dedup is improved in place (§5) instead.
 - **Trigger on `SessionEnd`.** Deferred — correct for a heavy once-per-session pass,
   but it is new hook-event work already specced in the capture design; this change
   mirrors the existing Stop-hook pattern to stay focused.
