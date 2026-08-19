@@ -186,6 +186,42 @@ func TestSpawnSupersedeIfConfigured_NoOpWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestSpawnReflectIfConfigured_NoOpWhenDisabled(t *testing.T) {
+	// With no config file present, reflection.auto_reflect defaults to false
+	// (internal/config/config.go's defaults map). spawnReflectIfConfigured must
+	// return immediately after that check — before ever calling config.DataDir
+	// (which creates ~/.local/share/ghost), let alone touching ghost.db, the
+	// pidfile, or reflect.log.
+	dataHome := isolatedHome(t)
+
+	spawnReflectIfConfigured("/tmp/does-not-matter")
+
+	if _, err := os.Stat(filepath.Join(dataHome, "ghost")); !os.IsNotExist(err) {
+		t.Errorf("expected ghost data dir to never be created when auto_reflect is disabled, stat err = %v", err)
+	}
+}
+
+func TestSpawnReflectIfConfigured_NoOpWithoutLLM(t *testing.T) {
+	// auto_reflect enabled, but no LLM is available (no API key, no claude, no
+	// opencode on PATH). The no-LLM guard must return before config.DataDir, so
+	// no Jaccard-only reflect ever spawns and no data dir is created.
+	dataHome := isolatedHome(t)
+	cfgDir := os.Getenv("XDG_CONFIG_HOME")
+	if err := os.MkdirAll(filepath.Join(cfgDir, "ghost"), 0o755); err != nil {
+		t.Fatalf("mkdir config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "ghost", "config.yaml"), []byte("reflection:\n  auto_reflect: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("PATH", t.TempDir()) // no claude, no opencode
+
+	spawnReflectIfConfigured("/tmp/does-not-matter")
+
+	if _, err := os.Stat(filepath.Join(dataHome, "ghost")); !os.IsNotExist(err) {
+		t.Errorf("expected no ghost data dir when no LLM is available, stat err = %v", err)
+	}
+}
+
 // TestClaimPidFile_ConcurrentCallersOnlyOneWins races many goroutines against
 // an empty pidPath, simulating near-simultaneous stop hooks for the same
 // project when no resolve has ever run. Exactly one must win the claim.

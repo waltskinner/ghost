@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/wcatz/ghost/internal/ai"
 	"github.com/wcatz/ghost/internal/config"
 	"github.com/wcatz/ghost/internal/memory"
 )
@@ -77,6 +78,7 @@ func HandleStopHook(stdin io.Reader, stdout io.Writer) {
 
 	spawnResolveIfConfigured(input.CWD)
 	spawnSupersedeIfConfigured(input.CWD)
+	spawnReflectIfConfigured(input.CWD)
 
 	if input.TranscriptPath == "" {
 		return
@@ -265,6 +267,80 @@ func spawnSupersedeIfConfigured(cwd string) {
 	defer logFile.Close() //nolint:errcheck
 
 	cmd := exec.Command(exe, "supersede", projectName, "--apply")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	detachProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	token, haveToken := processStartTime(cmd.Process.Pid)
+	_ = atomicWritePID(pidPath, cmd.Process.Pid, token, haveToken)
+	_ = cmd.Process.Release()
+}
+
+// spawnReflectIfConfigured starts `ghost reflect <project> --apply` as a
+// detached background process for the project matching cwd, if one isn't
+// already running for that project. Opt-in via reflection.auto_reflect
+// (default false). Every failure path returns silently: this must never block
+// or fail the stop hook.
+//
+// Unlike the resolve/supersede twins, this adds a no-LLM guard: consolidation
+// is only worth an unattended write when a real LLM tier is available. Without
+// an API key or a claude/opencode binary, --tier auto would fall through to the
+// Jaccard-only sqlite tier and rewrite every non-manual memory for no quality
+// gain, so the spawn is skipped entirely — before the DB is even opened, so
+// this stays a cheap read-only no-op.
+func spawnReflectIfConfigured(cwd string) {
+	if cwd == "" {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil || !cfg.Reflection.AutoReflect {
+		return
+	}
+	if cfg.API.Key == "" && !ai.NewCLIProvider().Available() {
+		return
+	}
+
+	dataDir, err := config.DataDir()
+	if err != nil {
+		return
+	}
+	dbPath := filepath.Join(dataDir, "ghost.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return
+	}
+	db, err := sql.Open("sqlite", roDSN(dbPath))
+	if err != nil {
+		return
+	}
+	defer db.Close() //nolint:errcheck
+
+	store := memory.NewStore(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	projectID, projectName, err := store.ResolveProject(context.Background(), cwd)
+	if err != nil || projectID == "" || projectName == "" {
+		return
+	}
+
+	pidPath := filepath.Join(dataDir, "reflect-"+projectID+".pid")
+	if isAlive(pidPath) {
+		return
+	}
+	if !claimPidFile(pidPath) {
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	logFile, err := os.OpenFile(filepath.Join(dataDir, "reflect.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer logFile.Close() //nolint:errcheck
+
+	cmd := exec.Command(exe, "reflect", projectName, "--apply")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	detachProcess(cmd)
