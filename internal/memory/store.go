@@ -27,6 +27,7 @@ type Memory struct {
 	Source       string   `json:"source"`
 	Tags         []string `json:"tags"`
 	Pinned       bool     `json:"pinned"`
+	ResolvedAt   *string  `json:"resolved_at,omitempty"`
 	CreatedAt    string   `json:"created_at"`
 	UpdatedAt    string   `json:"updated_at"`
 }
@@ -735,7 +736,7 @@ func (s *Store) GetTopMemories(ctx context.Context, projectID string, limit int)
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, project_id, category, content, importance, access_count,
-		       last_accessed, source, tags, pinned, created_at, updated_at
+		       last_accessed, source, tags, pinned, resolved_at, created_at, updated_at
 		FROM memories
 		WHERE (project_id = ? OR project_id = '_global')
 		  AND resolved_at IS NULL
@@ -776,7 +777,7 @@ func (s *Store) SearchFTS(ctx context.Context, projectID, query string, limit in
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.id, m.project_id, m.category, m.content, m.importance, m.access_count,
-		       m.last_accessed, m.source, m.tags, m.pinned, m.created_at, m.updated_at
+		       m.last_accessed, m.source, m.tags, m.pinned, m.resolved_at, m.created_at, m.updated_at
 		FROM memories m
 		JOIN memories_fts f ON f.rowid = m.rowid
 		WHERE (m.project_id = ? OR m.project_id = '_global')
@@ -798,7 +799,7 @@ func (s *Store) SearchFTSAll(ctx context.Context, query string, limit int) ([]Me
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.id, m.project_id, m.category, m.content, m.importance, m.access_count,
-		       m.last_accessed, m.source, m.tags, m.pinned, m.created_at, m.updated_at
+		       m.last_accessed, m.source, m.tags, m.pinned, m.resolved_at, m.created_at, m.updated_at
 		FROM memories m
 		JOIN memories_fts f ON f.rowid = m.rowid
 		WHERE memories_fts MATCH ?
@@ -819,7 +820,7 @@ func (s *Store) GetByCategory(ctx context.Context, projectID, category string, l
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, project_id, category, content, importance, access_count,
-		       last_accessed, source, tags, pinned, created_at, updated_at
+		       last_accessed, source, tags, pinned, resolved_at, created_at, updated_at
 		FROM memories
 		WHERE (project_id = ? OR project_id = '_global') AND category = ?
 		ORDER BY importance DESC, created_at DESC
@@ -839,7 +840,7 @@ func (s *Store) GetAll(ctx context.Context, projectID string, limit int) ([]Memo
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, project_id, category, content, importance, access_count,
-		       last_accessed, source, tags, pinned, created_at, updated_at
+		       last_accessed, source, tags, pinned, resolved_at, created_at, updated_at
 		FROM memories
 		WHERE project_id = ?
 		ORDER BY importance DESC, created_at DESC
@@ -890,7 +891,7 @@ func (s *Store) ResolveCandidates(ctx context.Context, projectID string) ([]Memo
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, project_id, category, content, importance, access_count,
-		       last_accessed, source, tags, pinned, created_at, updated_at
+		       last_accessed, source, tags, pinned, resolved_at, created_at, updated_at
 		FROM memories
 		WHERE project_id = ?
 		  AND resolved_at IS NULL
@@ -1152,16 +1153,18 @@ func (s *Store) ReplaceNonManual(ctx context.Context, projectID string, memories
 	defer tx.Rollback() //nolint:errcheck
 
 	// Snapshot existing non-manual memories before deleting. Pinned memories
-	// are excluded throughout this function — like source='manual', a pin is
-	// an explicit user override that reflection must never delete, rewrite,
-	// or silently drop (it has no way to know a consolidated memory it emits
-	// corresponds to a pinned one it never saw as such, so preservation has
-	// to mean "don't touch it" rather than "carry the flag through").
+	// and resolved memories are excluded throughout this function — like
+	// source='manual', a pin is an explicit user override and a resolved_at
+	// stamp is a resolve pass's verdict, both of which reflection must never
+	// delete, rewrite, or silently drop (it has no way to know a consolidated
+	// memory it emits corresponds to a pinned/resolved one it never saw as
+	// such, so preservation has to mean "don't touch it" rather than "carry the
+	// flag through"). See issue #318.
 	snapshotID := fmt.Sprintf("%s-%d", projectID, time.Now().Unix())
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO memory_snapshots (snapshot_id, project_id, category, content, importance, source, tags)
 		SELECT ?, project_id, category, content, importance, source, tags
-		FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0
+		FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0 AND resolved_at IS NULL
 	`, snapshotID, projectID)
 	if err != nil {
 		return fmt.Errorf("snapshot memories: %w", err)
@@ -1175,7 +1178,7 @@ func (s *Store) ReplaceNonManual(ctx context.Context, projectID string, memories
 	if consolidatedSince != "" {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT category, content, importance, source, tags
-			FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0 AND created_at >= ?
+			FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0 AND resolved_at IS NULL AND created_at >= ?
 		`, projectID, consolidatedSince)
 		if err != nil {
 			return fmt.Errorf("find concurrent memories: %w", err)
@@ -1197,7 +1200,7 @@ func (s *Store) ReplaceNonManual(ctx context.Context, projectID string, memories
 		}
 	}
 
-	_, err = tx.ExecContext(ctx, `DELETE FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0`, projectID)
+	_, err = tx.ExecContext(ctx, `DELETE FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0 AND resolved_at IS NULL`, projectID)
 	if err != nil {
 		return fmt.Errorf("delete old memories: %w", err)
 	}
@@ -1275,10 +1278,11 @@ func (s *Store) RestoreSnapshot(ctx context.Context, projectID string) (int, err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Delete current non-manual memories. Pinned memories are excluded, same
-	// as ReplaceNonManual: reflection never touched them, so restore must not
-	// delete them either — they aren't in the snapshot to bring back.
-	_, err = tx.ExecContext(ctx, `DELETE FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0`, projectID)
+	// Delete current non-manual memories. Pinned and resolved memories are
+	// excluded, same as ReplaceNonManual: reflection never touched them, so
+	// restore must not delete them either — they aren't in the snapshot to
+	// bring back. See issue #318.
+	_, err = tx.ExecContext(ctx, `DELETE FROM memories WHERE project_id = ? AND source != 'manual' AND pinned = 0 AND resolved_at IS NULL`, projectID)
 	if err != nil {
 		return 0, fmt.Errorf("delete current: %w", err)
 	}
@@ -1569,19 +1573,23 @@ func scanMemories(rows *sql.Rows) ([]Memory, error) {
 	for rows.Next() {
 		var m Memory
 		var lastAccessed sql.NullString
+		var resolvedAt sql.NullString
 		var tagsJSON string
 		var pinned int
 
 		if err := rows.Scan(
 			&m.ID, &m.ProjectID, &m.Category, &m.Content, &m.Importance,
 			&m.AccessCount, &lastAccessed, &m.Source, &tagsJSON,
-			&pinned, &m.CreatedAt, &m.UpdatedAt,
+			&pinned, &resolvedAt, &m.CreatedAt, &m.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan memory: %w", err)
 		}
 
 		if lastAccessed.Valid {
 			m.LastAccessed = &lastAccessed.String
+		}
+		if resolvedAt.Valid {
+			m.ResolvedAt = &resolvedAt.String
 		}
 		m.Pinned = pinned == 1
 

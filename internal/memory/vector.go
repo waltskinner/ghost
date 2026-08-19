@@ -406,7 +406,7 @@ func (s *Store) GetByIDs(ctx context.Context, ids []string) ([]Memory, error) {
 
 	query := fmt.Sprintf(`
 		SELECT id, project_id, category, content, importance, access_count,
-		       last_accessed, source, tags, pinned, created_at, updated_at
+		       last_accessed, source, tags, pinned, resolved_at, created_at, updated_at
 		FROM memories
 		WHERE id IN (%s)
 	`, strings.Join(placeholders, ","))

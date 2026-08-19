@@ -382,15 +382,33 @@ Flags:
 		fmt.Fprintf(os.Stderr, "error: get memories: %v\n", err)
 		os.Exit(1)
 	}
+	// Resolved-evidence memories are excluded from consolidation input: ghost
+	// resolve de-weighted them and they must survive reflect untouched, not be
+	// re-emitted as fresh unresolved duplicates by the consolidator (see issue
+	// #318). ReplaceNonManual independently excludes them from its delete, so
+	// they are never touched either way.
+	live := make([]memory.Memory, 0, len(existingMemories))
+	resolvedCount := 0
+	for _, m := range existingMemories {
+		if m.ResolvedAt != nil {
+			resolvedCount++
+			continue
+		}
+		live = append(live, m)
+	}
 	currentContext, _ := store.GetLearnedContext(ctx, projectID)
 	exchanges, _ := store.GetRecentExchanges(ctx, projectID, 15)
 
-	fmt.Printf("Memories:     %d existing\n", len(existingMemories))
+	if resolvedCount > 0 {
+		fmt.Printf("Memories:     %d existing (%d resolved, excluded from consolidation)\n", len(existingMemories), resolvedCount)
+	} else {
+		fmt.Printf("Memories:     %d existing\n", len(existingMemories))
+	}
 	fmt.Println("Running consolidation...")
 
 	input := reflection.ReflectionInput{
 		RecentExchanges:  exchanges,
-		ExistingMemories: existingMemories,
+		ExistingMemories: live,
 		CurrentContext:   currentContext,
 		ProjectName:      projectName,
 	}
