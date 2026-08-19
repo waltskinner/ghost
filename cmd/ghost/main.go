@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -69,6 +70,13 @@ func main() {
 		case "resolve":
 			runResolve()
 			return
+		case "project":
+			if len(os.Args) > 2 && os.Args[2] == "delete" {
+				runProjectDelete()
+				return
+			}
+			fmt.Fprintln(os.Stderr, "Usage: ghost project delete <name-or-id> [--apply]")
+			os.Exit(1)
 		case "upgrade":
 			runUpgrade()
 			return
@@ -689,6 +697,134 @@ subscription-billed 'claude' CLI call — requires one of the two.`)
 	}
 }
 
+// confirmProjectDeleteName reports whether typed (a raw scanned line, not
+// yet trimmed) matches expected exactly once surrounding whitespace is
+// stripped. Pulled out of runProjectDelete as its own pure function so the
+// actual confirmation decision is unit-testable without stdin/os.Exit
+// plumbing.
+func confirmProjectDeleteName(typed, expected string) bool {
+	return strings.TrimSpace(typed) == expected
+}
+
+// printDeleteSummary writes a DeleteProjectSummary to out in the fixed-width
+// format shared by both the dry-run preview and the post-apply report. It
+// returns the first write error encountered, if any.
+func printDeleteSummary(out io.Writer, summary memory.DeleteProjectSummary, verb string) error {
+	if _, err := fmt.Fprintf(out, "%s %q (%s):\n", verb, summary.ProjectName, summary.ProjectID); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  memories:     %d\n", summary.Memories); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  memory_links: %d\n", summary.MemoryLinks); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  tasks:        %d\n", summary.Tasks); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  decisions:    %d\n", summary.Decisions); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  token_usage:  %d\n", summary.TokenUsage); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "  audit_log:    %d\n", summary.AuditLog); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runProjectDeleteCore implements the confirmation-gated delete against an
+// already-open store: prints the dry-run summary, stops there unless apply
+// is set, and otherwise requires re-typing the project's name (read from in)
+// before calling store.DeleteProject with apply=true. Pulled out of
+// runProjectDelete — which owns CLI arg parsing, bootstrap(), and os.Exit —
+// so the confirmation gate is unit-testable against a real store with
+// injected stdin, without exercising process-exit paths.
+func runProjectDeleteCore(ctx context.Context, store *memory.Store, out io.Writer, in io.Reader, projectName string, apply bool) error {
+	summary, err := store.DeleteProject(ctx, projectName, false)
+	if err != nil {
+		return err
+	}
+	if err := printDeleteSummary(out, summary, "Would delete"); err != nil {
+		return err
+	}
+
+	if !apply {
+		if _, err := fmt.Fprintln(out, "\nRe-run with --apply to actually delete."); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if _, err := fmt.Fprintf(out, "\nType the project name (%q) to confirm deletion: ", summary.ProjectName); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(in)
+	scanner.Scan()
+	if !confirmProjectDeleteName(scanner.Text(), summary.ProjectName) {
+		return errors.New("confirmation did not match project name — nothing deleted")
+	}
+
+	// Reuse the ID resolved by the preview above rather than re-resolving
+	// projectName: the confirmation prompt waits on a human, and re-resolving
+	// a mutable name/path in that window could silently hit a different
+	// project if it was renamed or recreated in the meantime.
+	summary, err = store.DeleteProject(ctx, summary.ProjectID, true)
+	if err != nil {
+		return err
+	}
+	if err := printDeleteSummary(out, summary, "Deleted"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runProjectDelete implements `ghost project delete <name-or-id> [--apply]`.
+// Always prints the dry-run summary first. Without --apply it stops there.
+// With --apply, it re-prints the summary and requires re-typing the
+// project's name at a prompt before anything is actually deleted — this is
+// irreversible and there is no undo, so the flag alone is not enough.
+func runProjectDelete() {
+	var projectName string
+	apply := false
+	for i := 3; i < len(os.Args); i++ {
+		switch {
+		case os.Args[i] == "--apply":
+			apply = true
+		case !strings.HasPrefix(os.Args[i], "-"):
+			if projectName != "" {
+				fmt.Fprintln(os.Stderr, "error: expected exactly one project")
+				os.Exit(1)
+			}
+			projectName = os.Args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "error: unknown flag %q\n", os.Args[i])
+			os.Exit(1)
+		}
+	}
+	if projectName == "" {
+		fmt.Fprintln(os.Stderr, `Usage: ghost project delete <name-or-id> [flags]
+
+Flags:
+  --apply   Actually delete (default is dry-run/preview)
+
+Permanently removes a project: memories, tags, embeddings, links, tasks,
+decisions, learned context, reflection snapshots, and cost/audit history.
+Irreversible. Refuses to delete _global.`)
+		os.Exit(1)
+	}
+
+	_, _, store := bootstrap()
+	defer store.Close() //nolint:errcheck
+	ctx := context.Background()
+
+	if err := runProjectDeleteCore(ctx, store, os.Stdout, os.Stdin, projectName, apply); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // firstLine returns the first line of s, truncated to at most n runes with an
 // ellipsis, for compact CLI preview.
 func firstLine(s string, n int) string {
@@ -948,6 +1084,8 @@ Commands:
   reflect <project> [flags]   Memory consolidation (dry-run by default, --apply to save)
   supersede <project> [flags] Link superseded memories (dry-run by default, --apply to write)
   resolve <project> [flags]   Mark resolved evidence memories (dry-run by default, --apply to write)
+  project delete <name> [flags]  Permanently delete a project and everything under it
+                              (dry-run by default, --apply + name re-type to confirm)
   obsidian export [flags]     Mirror memories to an Obsidian vault (one-way)
   obsidian sync [flags]       Keep the vault mirror fresh (polls for DB changes)
   bench [--sweep]             Run the retrieval-quality benchmark (built-in dataset);

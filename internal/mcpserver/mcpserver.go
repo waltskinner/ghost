@@ -978,7 +978,7 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name:        "ghost_resolve",
 		Title:       "Resolve stale evidence",
-		Description: "Scans a project's memories for resolved-evidence notes (intermediate findings, changelog entries, superseded experiments) using the calling session's own model via MCP sampling — no Anthropic API credits spent. Dry-run by default; pass apply:true to stamp resolved_at.",
+		Description: "Scans a project's memories for resolved-evidence notes (intermediate findings, changelog entries, superseded experiments) using the calling session's own model via MCP sampling when the client supports it, falling back to a subscription-billed `claude -p` call otherwise (dry-run only on that fallback). No Anthropic API credits spent either way. Dry-run by default; pass apply:true to stamp resolved_at.",
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(false),
 			OpenWorldHint:   boolPtr(false),
@@ -998,12 +998,16 @@ func (s *Server) registerTools() {
 		if !ok {
 			return nil, nil, fmt.Errorf("ghost_resolve: store does not support resolve operations")
 		}
-		if req.Session == nil {
-			return nil, nil, fmt.Errorf("ghost_resolve: no active MCP session for sampling")
-		}
+		// req.Session is never nil here: every ServerRequest the go-sdk
+		// dispatches to a tool handler is constructed from a live
+		// *ServerSession (see mcp.ServerRequest's construction sites in
+		// shared.go/server.go) — there is no headless-invocation path for an
+		// MCP tool. The claude CLI fallback is always a fallback, never a
+		// full-trust primary, so an apply:true request can never write a
+		// CLI-only classification (see resolve.Run's anyFallback guard).
 		samplingProvider := ai.NewSamplingProvider(req.Session)
-		fallback := ai.NewFallbackProvider(samplingProvider, nil, false)
-		cls := resolve.NewHaikuClassifier(fallback)
+		provider := ai.NewAlwaysFallbackProvider(samplingProvider, ai.NewCLIClient(), true)
+		cls := resolve.NewHaikuClassifier(provider)
 		res, confirmed, err := resolve.Run(ctx, rs, cls, projectID, args.Apply, s.logger)
 		if err != nil {
 			return nil, nil, fmt.Errorf("ghost_resolve: %w", err)
@@ -1018,6 +1022,9 @@ func (s *Server) registerTools() {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%s: %d loaded, %d after prefilter, %d confirmed evidence, %s %d\n",
 			args.Project, res.Loaded, res.Candidates, res.Confirmed, verb, count)
+		if res.SkippedApply {
+			sb.WriteString("  apply skipped: classification used the claude CLI fallback (MCP sampling unavailable on this client) — rerun once sampling works to actually stamp resolved_at\n")
+		}
 		for _, m := range confirmed {
 			fmt.Fprintf(&sb, "  %s  [%s]  %s\n", shortID(m.ID), m.Category, firstLine(m.Content, 70))
 		}
@@ -1275,6 +1282,60 @@ func (s *Server) registerTools() {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: sb.String()}},
 		}, nil, nil
+	})
+
+	// ghost_project_delete — permanently delete a project and everything
+	// under it. Dry-run by default; apply:true actually deletes. _global is
+	// always refused, in both modes.
+	type projectDeleteArgs struct {
+		Project string `json:"project" jsonschema:"the project to delete (id, name, or path)"`
+		Apply   bool   `json:"apply,omitempty" jsonschema:"actually delete (default false: dry-run preview only)"`
+	}
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "ghost_project_delete",
+		Title:       "Delete Project",
+		Description: "Permanently deletes a project: memories, tags, embeddings, links, tasks, decisions, learned context, reflection snapshots, and cost/audit history. Irreversible — there is no undo. Dry-run by default (returns counts of what would be removed); pass apply:true to actually delete. Always refuses to delete the _global project. Only use when the user has explicitly and unambiguously asked to delete an entire project, never as a side effect of another request.",
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: boolPtr(true),
+			OpenWorldHint:   boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args projectDeleteArgs) (*mcp.CallToolResult, any, error) {
+		if args.Project == "" {
+			return nil, nil, fmt.Errorf("project is required")
+		}
+		summary, err := s.store.DeleteProject(ctx, args.Project, args.Apply)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ghost_project_delete: %w", err)
+		}
+		if args.Apply {
+			// notifyProjectResource's hash/name alias lookup queries
+			// ListProjects, which no longer has a row for this project once
+			// DeleteProject has committed — it would only ever emit the ID
+			// form. Emit both aliases directly from the summary instead,
+			// since DeleteProject already resolved and returned them.
+			for _, suffix := range []string{"context", "tasks", "decisions"} {
+				s.notifyResourceUpdated(ctx, "ghost://project/"+summary.ProjectID+"/"+suffix)
+				if summary.ProjectName != summary.ProjectID {
+					s.notifyResourceUpdated(ctx, "ghost://project/"+summary.ProjectName+"/"+suffix)
+				}
+			}
+		}
+		verb := "Would delete"
+		if args.Apply {
+			verb = "Deleted"
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "%s %q (%s):\n", verb, summary.ProjectName, summary.ProjectID)
+		fmt.Fprintf(&sb, "  memories:     %d\n", summary.Memories)
+		fmt.Fprintf(&sb, "  memory_links: %d\n", summary.MemoryLinks)
+		fmt.Fprintf(&sb, "  tasks:        %d\n", summary.Tasks)
+		fmt.Fprintf(&sb, "  decisions:    %d\n", summary.Decisions)
+		fmt.Fprintf(&sb, "  token_usage:  %d\n", summary.TokenUsage)
+		fmt.Fprintf(&sb, "  audit_log:    %d\n", summary.AuditLog)
+		if !args.Apply {
+			sb.WriteString("\nRe-run with apply:true to actually delete.")
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: sb.String()}}}, nil, nil
 	})
 
 	// ghost_memory_pin — pin or unpin a memory.
