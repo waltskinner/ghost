@@ -55,7 +55,10 @@ func (s *SQLiteConsolidator) Consolidate(_ context.Context, input ReflectionInpu
 			}
 
 			sim := jaccard(items[i].tokens, items[j].tokens)
-			if sim >= 0.5 {
+			if c := containment(items[i].tokens, items[j].tokens); c > sim {
+				sim = c
+			}
+			if sim >= 0.5 && !numericConflict(items[i].tokens, items[j].tokens) {
 				absorbed[j] = true
 				if mems[j].Importance > best.Importance {
 					best.Importance = mems[j].Importance
@@ -93,13 +96,23 @@ func (s *SQLiteConsolidator) Consolidate(_ context.Context, input ReflectionInpu
 	}, nil
 }
 
-// tokenize splits text into a set of lowercase word tokens (length > 1).
+// stopwords are filler words that carry no consolidation signal; dropping them
+// keeps Jaccard/containment from being diluted on longer memories.
+var stopwords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "by": true, "for": true, "from": true, "in": true, "is": true,
+	"it": true, "of": true, "on": true, "or": true, "that": true, "the": true,
+	"this": true, "to": true, "with": true,
+}
+
+// tokenize splits text into a set of lowercase word tokens (length > 1),
+// excluding stopwords.
 func tokenize(s string) map[string]bool {
 	tokens := make(map[string]bool)
 	for _, word := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
-		if len(word) > 1 {
+		if len(word) > 1 && !stopwords[word] {
 			tokens[word] = true
 		}
 	}
@@ -158,6 +171,52 @@ func looksLikeSecret(lower string) bool {
 		}
 	}
 	return false
+}
+
+// containment is the overlap coefficient |A∩B| / min(|A|,|B|): it catches a
+// memory that is a strict subset of another ("use sqlite" inside "use sqlite
+// for storage"), which symmetric Jaccard scores too low to merge.
+func containment(a, b map[string]bool) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	intersection := 0
+	for token := range a {
+		if b[token] {
+			intersection++
+		}
+	}
+	denom := len(a)
+	if len(b) < denom {
+		denom = len(b)
+	}
+	return float64(intersection) / float64(denom)
+}
+
+// numericConflict reports whether the two token sets differ on a purely-numeric
+// token — a precise fact ("port 80" vs "port 81") that must not be merged even
+// when the surrounding words overlap heavily.
+func numericConflict(a, b map[string]bool) bool {
+	for token := range a {
+		if isNumericToken(token) && !b[token] {
+			return true
+		}
+	}
+	for token := range b {
+		if isNumericToken(token) && !a[token] {
+			return true
+		}
+	}
+	return false
+}
+
+func isNumericToken(s string) bool {
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // jaccard computes the Jaccard similarity coefficient between two token sets.

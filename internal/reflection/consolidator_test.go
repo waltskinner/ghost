@@ -399,6 +399,66 @@ func TestTieredConsolidator_QualityGateSkipsSmallInput(t *testing.T) {
 	}
 }
 
+func TestSQLiteConsolidator_SubsetMergesViaContainment(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "use sqlite", Importance: 0.6},
+			{Category: "fact", Content: "use sqlite for storage with fts5 search", Importance: 0.8},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 1 {
+		t.Fatalf("expected subset to merge into superset, got %d memories", len(result.Memories))
+	}
+	if result.Memories[0].Importance != 0.8 {
+		t.Errorf("merged memory should keep higher importance 0.8, got %v", result.Memories[0].Importance)
+	}
+}
+
+func TestSQLiteConsolidator_NumericDifferenceBlocksMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "k3s runs grafana on port 80", Importance: 0.7},
+			{Category: "fact", Content: "k3s runs grafana on port 81", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected numeric difference to block merge, got %d memories", len(result.Memories))
+	}
+}
+
+func TestTokenize_ExcludesStopwords(t *testing.T) {
+	tokens := tokenize("ghost uses sqlite for the storage with fts5")
+	if tokens["the"] || tokens["for"] || tokens["with"] {
+		t.Errorf("stopwords should be excluded, got %v", tokens)
+	}
+	if !tokens["ghost"] || !tokens["sqlite"] || !tokens["storage"] {
+		t.Errorf("content words should be kept, got %v", tokens)
+	}
+}
+
+func TestContainment(t *testing.T) {
+	a := map[string]bool{"go": true, "sqlite": true}
+	b := map[string]bool{"go": true, "sqlite": true, "fts5": true, "storage": true}
+	if got := containment(a, b); got != 1.0 {
+		t.Errorf("containment(subset, superset) = %v, want 1.0", got)
+	}
+	c := map[string]bool{"go": true}
+	d := map[string]bool{"sqlite": true}
+	if got := containment(c, d); got != 0.0 {
+		t.Errorf("containment(disjoint) = %v, want 0.0", got)
+	}
+}
+
 func TestHaikuConsolidator_NilClient(t *testing.T) {
 	h := NewHaikuConsolidator(nil)
 	if h.Available(context.Background()) {
