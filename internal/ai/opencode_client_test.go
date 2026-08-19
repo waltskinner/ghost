@@ -86,3 +86,24 @@ case "$last" in *SYSTEM*USER*) printf '%s\n' '{"type":"text","part":{"type":"tex
 		t.Errorf("got %q, want %q", text, "KEEP")
 	}
 }
+
+func TestOpenCodeClient_ScrubsEnv(t *testing.T) {
+	bin := fakeOpenCodeBinary(t, `
+if [ -n "$ANTHROPIC_API_KEY" ]; then echo "LEAKED API KEY" >&2; exit 1; fi
+case "$XDG_CONFIG_HOME" in
+  *ghost-opencode-*) ;;
+  *) echo "XDG_CONFIG_HOME not scrubbed: $XDG_CONFIG_HOME" >&2; exit 1;;
+esac
+printf '%s\n' '{"type":"text","part":{"type":"text","text":"OK"}}'
+`)
+	t.Setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
+	t.Setenv("XDG_CONFIG_HOME", "/tmp/fake-real-config")
+	c := &OpenCodeClient{binary: bin}
+	text, _, err := c.Reflect(context.Background(), "prompt")
+	if err != nil {
+		t.Fatalf("Reflect: %v", err)
+	}
+	if text != "OK" {
+		t.Errorf("got %q, want OK", text)
+	}
+}

@@ -1107,9 +1107,10 @@ Flags (reflect):
 Environment:
   ANTHROPIC_API_KEY           Required for reflect --tier haiku. supersede/resolve fall
                               back to a subscription-billed 'claude' CLI call (requires
-                              the 'claude' binary on PATH); reflect --tier
-                              cli/opencode/auto falls back to 'claude' or 'opencode'
-                              (whichever is on PATH). All when unset or exhausted.
+                              the 'claude' binary on PATH); reflect --tier auto falls
+                              back to 'claude' or 'opencode' (whichever is on PATH),
+                              and --tier cli/opencode require their respective binary.
+                              All when unset or exhausted.
   GHOST_DEBUG                 Enable debug logging
 `, version)
 }
