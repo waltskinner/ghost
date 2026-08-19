@@ -42,6 +42,7 @@ type APIConfig struct {
 type ReflectionConfig struct {
 	AutoResolve   bool `koanf:"auto_resolve"`
 	AutoSupersede bool `koanf:"auto_supersede"`
+	AutoReflect   bool `koanf:"auto_reflect"`
 }
 
 // EmbeddingConfig holds local embedding settings.
@@ -75,6 +76,7 @@ var defaults = map[string]interface{}{
 	"embedding.dimensions":       768,
 	"reflection.auto_resolve":    false,
 	"reflection.auto_supersede":  false,
+	"reflection.auto_reflect":    false,
 	"linking.enabled":            true,
 	"linking.threshold":          0.70,
 	"linking.demotion_threshold": 0.90,
