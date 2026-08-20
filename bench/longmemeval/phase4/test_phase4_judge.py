@@ -1,10 +1,12 @@
-"""Tests for cmd_judge abstention prompt routing."""
+"""Tests for cmd_judge abstention prompt routing and _report."""
 
 import json
 import os
 import sys
 import tempfile
 from unittest import mock
+
+sys.path.insert(0, os.path.dirname(__file__))
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -197,3 +199,116 @@ def test_mixed_dataset_correct_routing():
         assert len(non_abs_rows) == 2
         assert _fake_abstention_prompt.call_count == 3
         assert _fake_anscheck_prompt.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _report blended accuracy tests
+# ---------------------------------------------------------------------------
+
+def _write_report_rows(path, rows):
+    with open(path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_report_shows_three_accuracies(capsys):
+    """_report should print blended, non-abstention, and abstention accuracies."""
+    with mock.patch.dict(sys.modules, {
+        "run_generation": mock.MagicMock(),
+        "evaluate_qa": mock.MagicMock(),
+        "abstention_prompt": mock.MagicMock(),
+        "tiktoken": mock.MagicMock(),
+    }):
+        from phase4_run import _report
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "results.jsonl")
+            rows = [
+                {"question_type": "fact", "abstention": False, "autoeval_label": True},
+                {"question_type": "fact", "abstention": False, "autoeval_label": False},
+                {"question_type": "fact", "abstention": True,  "autoeval_label": True},
+            ]
+            _write_report_rows(path, rows)
+            _report(path)
+            out = capsys.readouterr().out
+
+            assert "blended 500-question" in out
+            assert "non-abstention 470-question" in out
+            assert "abstention 30-question" in out
+
+            # blended: 2/3, non-abstention: 1/2, abstention: 1/1
+            assert "0.6667" in out
+            assert "0.5000" in out
+            assert "1.0000" in out
+
+
+def test_report_per_type_non_abstention_only(capsys):
+    """Per-type breakdown should only include non-abstention rows."""
+    with mock.patch.dict(sys.modules, {
+        "run_generation": mock.MagicMock(),
+        "evaluate_qa": mock.MagicMock(),
+        "abstention_prompt": mock.MagicMock(),
+        "tiktoken": mock.MagicMock(),
+    }):
+        from phase4_run import _report
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "results.jsonl")
+            rows = [
+                {"question_type": "fact", "abstention": False, "autoeval_label": True},
+                {"question_type": "fact", "abstention": True,  "autoeval_label": False},
+                {"question_type": "temporal", "abstention": False, "autoeval_label": False},
+            ]
+            _write_report_rows(path, rows)
+            _report(path)
+            out = capsys.readouterr().out
+
+            assert "Per question_type (non-abstention):" in out
+            assert "fact" in out
+            assert "temporal" in out
+            # fact non-abstention count should be 1 (the True one), not 2
+            assert "n=1" in out
+
+
+def test_report_empty_abstention(capsys):
+    """All rows non-abstention: abstention acc should show 0.0000 with n=0."""
+    with mock.patch.dict(sys.modules, {
+        "run_generation": mock.MagicMock(),
+        "evaluate_qa": mock.MagicMock(),
+        "abstention_prompt": mock.MagicMock(),
+        "tiktoken": mock.MagicMock(),
+    }):
+        from phase4_run import _report
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "results.jsonl")
+            rows = [
+                {"question_type": "fact", "abstention": False, "autoeval_label": True},
+                {"question_type": "fact", "abstention": False, "autoeval_label": True},
+            ]
+            _write_report_rows(path, rows)
+            _report(path)
+            out = capsys.readouterr().out
+
+            assert "abstention 30-question" in out
+            assert "  Abstention:     0" in out
+
+
+def test_report_empty_file():
+    """Empty file should sys.exit."""
+    with mock.patch.dict(sys.modules, {
+        "run_generation": mock.MagicMock(),
+        "evaluate_qa": mock.MagicMock(),
+        "abstention_prompt": mock.MagicMock(),
+        "tiktoken": mock.MagicMock(),
+    }):
+        from phase4_run import _report
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "empty.jsonl")
+            open(path, "w").close()
+            try:
+                _report(path)
+                assert False, "Expected SystemExit"
+            except SystemExit as e:
+                assert "no rows" in str(e)
