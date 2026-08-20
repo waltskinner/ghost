@@ -342,8 +342,9 @@ func TestTieredConsolidator_QualityGateRejectsGarbage(t *testing.T) {
 	}
 }
 
-func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
-	// Even if the last tier returns few memories, it's accepted (no fallback available).
+func TestTieredConsolidator_QualityGateAcceptsMechanicalTier(t *testing.T) {
+	// The mechanical fallback (SQLite) is accepted even when it returns few
+	// memories — it's deterministic, it can't truncate or hallucinate.
 	inputMems := make([]memory.Memory, 10)
 	for i := range inputMems {
 		inputMems[i] = memory.Memory{Category: "fact", Content: "memory", Importance: 0.7}
@@ -352,6 +353,7 @@ func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
 	sparse := &stubConsolidator{
 		name:      "sqlite",
 		available: true,
+		mechanical: true,
 		result: ReflectionResult{
 			LearnedContext: "sparse-ctx",
 			Memories: []ReflectMemory{
@@ -366,7 +368,36 @@ func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.LearnedContext != "sparse-ctx" {
-		t.Errorf("expected last tier accepted regardless, got %q", result.LearnedContext)
+		t.Errorf("expected mechanical tier accepted regardless, got %q", result.LearnedContext)
+	}
+}
+
+func TestTieredConsolidator_QualityGateRejectsLastLLMTier(t *testing.T) {
+	// wcatz round-2 finding: with --require-llm the sqlite tier is omitted from
+	// the auto list, so the LAST tier is a real LLM (cli). It must NOT be exempt
+	// from the quality gate merely because it's last — truncated/hallucinated
+	// output would otherwise be silently applied and ReplaceNonManual would
+	// delete the other live memories.
+	inputMems := make([]memory.Memory, 10)
+	for i := range inputMems {
+		inputMems[i] = memory.Memory{Category: "fact", Content: "memory", Importance: 0.7}
+	}
+
+	sparseLLM := &stubConsolidator{
+		name:      "cli",
+		available: true,
+		result: ReflectionResult{
+			LearnedContext: "truncated-ctx",
+			Memories: []ReflectMemory{
+				{Category: "fact", Content: "only-one", Importance: 0.5, Tags: []string{}},
+			},
+		},
+	}
+
+	tc := NewTieredConsolidator([]Consolidator{sparseLLM}, slog.Default())
+	_, err := tc.Consolidate(context.Background(), ReflectionInput{ExistingMemories: inputMems})
+	if err == nil {
+		t.Fatal("expected error: last-tier LLM must be rejected by the quality gate")
 	}
 }
 
@@ -522,12 +553,14 @@ func TestHaikuConsolidator_NilClient(t *testing.T) {
 type stubConsolidator struct {
 	name      string
 	available bool
+	mechanical bool
 	result    ReflectionResult
 	err       error
 }
 
 func (s *stubConsolidator) Name() string                     { return s.name }
 func (s *stubConsolidator) Available(_ context.Context) bool { return s.available }
+func (s *stubConsolidator) Mechanical() bool                 { return s.mechanical }
 func (s *stubConsolidator) Consolidate(_ context.Context, _ ReflectionInput) (ReflectionResult, error) {
 	return s.result, s.err
 }

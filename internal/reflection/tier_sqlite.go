@@ -18,6 +18,8 @@ func NewSQLiteConsolidator() *SQLiteConsolidator {
 
 func (s *SQLiteConsolidator) Name() string { return "sqlite" }
 
+func (s *SQLiteConsolidator) Mechanical() bool { return true }
+
 func (s *SQLiteConsolidator) Available(_ context.Context) bool { return true }
 
 func (s *SQLiteConsolidator) Consolidate(_ context.Context, input ReflectionInput) (ReflectionResult, error) {

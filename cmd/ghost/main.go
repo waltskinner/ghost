@@ -328,7 +328,11 @@ Flags:
 			binary = cfg.CLI.ClaudeBinary
 		}
 		if _, err := exec.LookPath(binary); err != nil {
-			fmt.Fprintln(os.Stderr, "error: cli tier requires the `claude` binary on PATH (or set cli.claude_binary)")
+			hint := "set cli.claude_binary"
+			if cfg.CLI.ClaudeBinary != "" {
+				hint = "check that cli.claude_binary (" + binary + ") is a valid, executable path"
+			}
+			fmt.Fprintf(os.Stderr, "error: cli tier requires the `%s` binary on PATH (or %s)\n", binary, hint)
 			os.Exit(1)
 		}
 		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClientWithBinary(binary), "cli")
@@ -338,7 +342,11 @@ Flags:
 			binary = cfg.CLI.OpenCodeBinary
 		}
 		if _, err := exec.LookPath(binary); err != nil {
-			fmt.Fprintln(os.Stderr, "error: opencode tier requires the `opencode` binary on PATH (or set cli.opencode_binary)")
+			hint := "set cli.opencode_binary"
+			if cfg.CLI.OpenCodeBinary != "" {
+				hint = "check that cli.opencode_binary (" + binary + ") is a valid, executable path"
+			}
+			fmt.Fprintf(os.Stderr, "error: opencode tier requires the `%s` binary on PATH (or %s)\n", binary, hint)
 			os.Exit(1)
 		}
 		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClientWithBinary(binary), "opencode")

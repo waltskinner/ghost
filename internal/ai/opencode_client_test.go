@@ -61,6 +61,20 @@ func TestParseOpenCodeOutput_MalformedLineErrors(t *testing.T) {
 	}
 }
 
+func TestParseOpenCodeOutput_BlankLinesSkipped(t *testing.T) {
+	raw := `{"type":"text","part":{"id":"a","type":"text","text":"OK"}}
+
+{"type":"text","part":{"id":"b","type":"text","text":" fine"}}
+`
+	got, err := parseOpenCodeOutput(raw)
+	if err != nil {
+		t.Fatalf("parseOpenCodeOutput: %v", err)
+	}
+	if got != "OK fine" {
+		t.Errorf("got %q, want blank lines skipped", got)
+	}
+}
+
 func TestOpenCodeClient_Reflect_ReturnsConcatenatedText(t *testing.T) {
 	bin := fakeOpenCodeBinary(t, `printf '%s\n' '{"type":"text","part":{"type":"text","text":"HELLO"}}' '{"type":"text","part":{"type":"text","text":" WORLD"}}'`)
 	c := &OpenCodeClient{binary: bin}

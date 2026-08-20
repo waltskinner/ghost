@@ -115,11 +115,16 @@ type opencodeEvent struct {
 // line that isn't valid JSON, or a line exceeding the scanner buffer, is an
 // error rather than a silent skip — a malformed stream means the answer is
 // incomplete, and treating it as a clean reflection output would be wrong.
+// Blank lines are skipped defensively (opencode may emit an empty line
+// mid-stream without it indicating truncation).
 func parseOpenCodeOutput(raw string) (string, error) {
 	var sb strings.Builder
 	sc := bufio.NewScanner(strings.NewReader(raw))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
+		if len(strings.TrimSpace(string(sc.Bytes()))) == 0 {
+			continue
+		}
 		var ev opencodeEvent
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 			return "", fmt.Errorf("opencode run: unparseable output line: %w", err)
