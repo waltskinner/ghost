@@ -162,6 +162,22 @@ Estimated cost at `topk_context=5` over the full 470 answerable questions: ~$20 
 
 Reference points, all judged with the official GPT-4o harness but with **different generators** (which dominate the score — compare within-generator only): Zep 71.2% and full-context 60.2% (GPT-4o generator); Mastra 94.87% (gpt-5-mini generator; 84.23% with GPT-4o); agentmemory 96.2% (Claude Opus 4.6 generator, temperature 0).
 
+### Abstention Scoring
+
+The official LongMemEval benchmark includes 30 abstention questions (question_id suffix `_abs`) where the correct behavior is to decline answering. Most third-party implementations score abstention via LLM judge (did the system correctly refuse?) and fold it into headline accuracy.
+
+**Previous approach:** Excluded abstention from scoring (470-question accuracy). This inflated scores compared to competitors who include abstention.
+
+**Current approach:** 
+- Phase 1 (retrieval-only): Excludes abstention (IR metrics can't evaluate "no evidence" questions)
+- Phase 4 (end-to-end): Includes all 500 questions with abstention-specific judge prompts
+- Reports three accuracy numbers:
+  - **Blended (500-question):** Fair comparison with competitors
+  - **Non-abstention (470-question):** Backward-compatible with previous reports
+  - **Abstention (30-question):** Shows refusal accuracy
+
+**Why this matters:** Abstention is typically where retrieval-heavy systems perform worst — over-eager retrieval hallucinates answers instead of declining. Including abstention in the score provides a more honest assessment of system capabilities.
+
 ## Classifier fallback verification (2026-07-26)
 
 The headless CLI path (`ghost resolve`/`ghost supersede`, and the stop hook's
