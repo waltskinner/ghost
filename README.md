@@ -105,17 +105,18 @@ Switching migrates your existing Claude Code memories into Ghost — at init or 
 
 Ghost's bet: a memory system should be *smaller* than the thing it remembers. The alternatives make you choose between cloud memory services (your codebase's context on someone else's server, metered per request) and self-hosted stacks (Postgres plus a vector DB before you've saved a single memory).
 
-As far as we know, Ghost is the only memory system that packs local hybrid vector + full-text search, automatic consolidation, time-decay scoring, and a memory graph into a single zero-infrastructure binary. The field as of July 2026 — corrections welcome, [open an issue](https://github.com/wcatz/ghost/issues):
+As far as we know, Ghost is the only memory system that packs local hybrid vector + full-text search, on-demand consolidation, time-decay scoring, memory lifecycle management, and a memory graph into a single zero-infrastructure binary. The field as of August 2026 — corrections welcome, [open an issue](https://github.com/wcatz/ghost/issues):
 
-| | What you install | Vector search | Consolidation | Time decay | Memory graph | Any MCP client |
+| | What you install | Vector search | Consolidation | Time decay | Memory lifecycle | Any MCP client |
 |---|---|---|---|---|---|---|
-| **Ghost** | one static Go binary | local (Ollama, optional) | yes | yes | yes | yes |
+| **Ghost** | one static Go binary | local (Ollama, optional) | yes | yes | resolve + supersede + demote + link | yes |
+| Mem0 (self-hosted) | FastAPI + Postgres + Qdrant/Neo4j | server-side | yes | no | extraction only | via OpenMemory (Docker) |
+| Zep (self-hosted) | Graphiti + Neo4j/FalkorDB | server-side | no | temporal graph | temporal fact chains | yes (MCP) |
+| Supermemory | self-hosted binary or cloud | hybrid | yes | temporal | dual-profile | yes (MCP) |
+| Claude Code | built-in to CLI | file-based index | Dreams (managed) | no | none | Claude Code only |
 | Engram | one Go binary | no (FTS only) | no | no | no | yes |
-| claude-mem | npm package | yes | yes | no | no | Claude Code only |
-| Mem0 (self-hosted) | FastAPI + Postgres + Qdrant/Neo4j | server-side | yes | no | graph variant | via OpenMemory (Docker) |
-| basic-memory | Python (AGPL) | yes | manual capture | no | wikilinks | yes |
 
-Mem0, Zep, and supermemory are excellent hosted products — but self-hosting them means running a service stack. If all you want is full-text search in a single binary, Engram is a fine, simpler choice.
+Mem0 and Zep are excellent products, but self-hosting them means running a service stack (Postgres, Neo4j, Qdrant). Supermemory offers a self-hosted binary or cloud option. Ghost ships as a single binary with zero infrastructure. If all you want is full-text search in a single binary, Engram is a fine, simpler choice.
 
 ## The questions you should be asking
 
@@ -131,15 +132,7 @@ A bounded digest, and you can inspect it yourself. The session-start hook emits:
 echo '{"cwd":"'"$PWD"'"}' | ghost hook session-start
 ```
 
-No mystery blob in your system prompt. Save-time dedup keeps the digest from bloating, and time-decay scoring weights `ghost_project_context` and resource reads toward what's still true.
-
-A few deliberate cuts keep the hook's footprint small:
-
-- **Subagent sessions get nothing.** A session spawned via the Agent/Task tool (or a Workflow `agent()` call) already inherits its working context in-band from the parent's prompt, so the hook exits immediately rather than paying for a redundant dump. A subagent that genuinely needs project memory can still call `ghost_project_context` itself.
-- **Resume and compact don't re-pay the full cost.** `resume` skips injection entirely — the original startup injection is already in the resumed transcript. `compact` emits a one-line pointer ("call `ghost_project_context` if you need the full detail again") instead of betting that compaction preserved the earlier block verbatim.
-- **Global memories are capped and deduplicated separately from project memories** — 8 items, ranked by pinned status then importance then recency, with near-duplicate globals filtered out outright rather than relying on the cap alone to drop them.
-- **Project memories rank by the same decayed score used everywhere else** — importance × category-aware time-decay × a pinned boost (the same formula `ghost_memory_search` and `ghost_project_context` use), capped at 15 items with content truncated to 200 bytes each. Both the globals and memories sections tell you how many more exist and how they're ranked whenever the cap trims the list.
-- **Stored memory content is always wrapped in `«...»` data delimiters**, including on the no-project-match path when only global memories are shown. Anything inside the delimiters is stored data, never a new instruction — even if it reads like one.
+No mystery blob in your system prompt. Save-time dedup keeps the digest from bloating, and time-decay scoring weights `ghost_project_context` and resource reads toward what's still true. Subagent sessions get nothing (they inherit context in-band from the parent); `resume` skips injection; `compact` emits a one-line pointer instead of re-dumping. Full details in [docs/architecture.md](docs/architecture.md).
 
 ### What's the exit story?
 
@@ -186,7 +179,7 @@ Facts about your stack shouldn't expire. Last month's debugging detour should. T
 | `architecture`, `pattern` | 45-day scale | 0.3 |
 | `decision`, `gotcha`, `dependency` | 30-day scale | 0.15 |
 
-Pinned memories get a 1.5× boost on top.
+Pinned memories are fully exempt from decay — they score at raw importance regardless of age or category.
 
 ### Consolidation you can undo
 
@@ -201,6 +194,17 @@ Pinned memories get a 1.5× boost on top.
 ### Tasks, decisions, and global memory
 
 Beyond memories: tasks (`pending`/`active`/`done`/`blocked`), decision records with rationale and alternatives (`active`/`superseded`/`revisit`), and a `_global` project whose memories are included in every project's context. Projects resolve by longest path-prefix match with a basename fallback, so worktrees and moved checkouts still find their memory.
+
+### Memory lifecycle
+
+Saving a memory is the beginning, not the end. Ghost tracks what happened *after* you saved — which facts got replaced, which findings turned out to be intermediate, which memories are near-duplicates of each other — and uses that to keep search results honest:
+
+- **Resolve** (`ghost resolve`) — marks resolved-evidence memories (changelog entries, cost estimates, closed experiment notes) with `resolved_at`, dropping them from ranked injection while keeping them searchable. Uses MCP Sampling for zero-credit classification in live sessions; the CLI path uses an API key.
+- **Supersede** (`ghost supersede`) — creates directed `supersedes` links between memories (newer replaces older). A single LLM call classifies each candidate pair as SUPERSEDES / CAUSES / NEITHER. Re-runnable and self-healing after consolidation rewrites memories.
+- **Demote** — when a superseded memory and its replacement both appear in search results, the older one is sunk below every present superseder. No global recency prior (those destroy old-but-correct retrieval — measured, published, ship-off) — just targeted demotion on genuine replacement pairs. Flips staleness fresh-wins from 0.083 to 1.000 while leaving unrelated retrieval untouched (see [staleness suite](docs/benchmarks.md#phase-3--staleness-suite-the-flagship)).
+- **Link** — a background worker auto-links related memories (cosine ≥ 0.70) into a graph. Links power the Obsidian mirror's graph view, supersedes ranking, and near-duplicate demotion at injection time.
+
+Most memory systems extract a fact and forget about it. Ghost's lifecycle is the pipeline that keeps facts true over time.
 
 ### Obsidian vault mirror
 
@@ -234,12 +238,12 @@ Because the mirror is one-way, edits inside the vault are informational only and
 
 ## MCP surface
 
-20 tools, 4 resources:
+19 tools, 4 resources:
 
 | Group | Tools |
 |---|---|
 | Memory | `ghost_memory_save` `ghost_memory_search` `ghost_search_all` `ghost_memories_list` `ghost_memory_update` `ghost_memory_delete` `ghost_memory_pin` `ghost_memory_promote` `ghost_save_global` `ghost_resolve` |
-| Context | `ghost_project_context` `ghost_list_projects` `ghost_health` `ghost_project_delete` |
+| Context | `ghost_project_context` `ghost_list_projects` `ghost_health` |
 | Tasks | `ghost_task_create` `ghost_task_list` `ghost_task_update` `ghost_task_complete` |
 | Decisions | `ghost_decision_record` `ghost_decisions_list` |
 
@@ -260,7 +264,6 @@ ghost hook stop              # Stop hook — blocks stop once if a tool-using se
 ghost reflect <project>      # Memory consolidation (dry-run by default; --apply, --restore, --tier)
 ghost resolve <project>      # De-weight resolved-evidence memories from injection (dry-run by default; --apply)
 ghost supersede <project>    # Link superseded memories (dry-run by default; --apply, --threshold)
-ghost project delete <name>  # Permanently delete a project (dry-run by default; --apply + re-type name to confirm)
 ghost bench [--sweep]        # Retrieval-quality benchmark on the built-in dataset
 ghost obsidian export        # Mirror memories to an Obsidian vault (one-way; --out, --project)
 ghost obsidian sync          # Keep the vault mirror fresh (--interval; polls for DB changes)
@@ -295,7 +298,7 @@ Note: env-var names map underscores to config dots, so keys that themselves cont
 
 ## Benchmarks
 
-Every number below is deterministic, judge-free, reproducible with the in-repo harnesses, and shipped with per-question logs. Full methodology in [docs/benchmarks.md](docs/benchmarks.md).
+Every number below is reproducible with the in-repo harnesses, and shipped with per-question logs. Retrieval-only metrics are deterministic given the embedding cache; end-to-end scores are recorded runs (model-pinned, single-run — rerun variance is possible but small at temperature 0). Full methodology in [docs/benchmarks.md](docs/benchmarks.md).
 
 **LongMemEval-S** ([the consensus long-term-memory benchmark](https://arxiv.org/abs/2410.10813); cleaned variant, session-level retrieval against the official evidence labels, all 470 answerable questions, no LLM judge):
 
@@ -325,7 +328,28 @@ hybrid+graph     0.500   0.964   1.000    0.780    0.824
 - **We ran the ablations, found our own regression, and fixed it.** The graph-expansion ranking bonus *hurt* retrieval (`hybrid+graph`), so it ships disabled — the table keeps measuring it so a redesign has a bar to clear. `ghost bench --sweep` grid-searches the fusion parameters if you want to check our tuning.
 - **The staleness suite** ("prod ran Postgres 14, we migrated to 16" — does search rank the fresh fact first?) runs report-only in CI. At the shipped default, fresh facts are always retrieved but outrank their superseded versions only 8% of the time — a failure no memory system we know of even measures. An off-by-default recency prior flips it to 100% in the sweep — but a *recency-trap* fixture (older memory is the correct answer) proved a global prior can't be the default: it's a cliff, every weight that fixes staleness destroys old-but-still-correct retrieval. The targeted fix does clear it: directed `supersedes` links, consumed by a demote that fires only when a memory's actual replacement co-occurs — flipping staleness to **100% while leaving the trap at 0.929, untouched** (the free lunch the global prior couldn't be), because it only ever acts on genuine replacement pairs. Both halves now ship: `ghost supersede` creates the links (cosine proposes, Haiku confirms — 8/8 on a labeled genuine-vs-parallel set), and `SearchParams.SupersedeDemote` consumes them. Both are opt-in today; wiring the consumer into default search is the last, deliberately-gated step (it changes live ranking). Publishing the negative result, the reason, *and* the fix that survives it is the point.
 
-Skipped deliberately: LOCOMO (publicly audited answer-key and judge problems) and DMR. **End-to-end LongMemEval-S** with the official GPT-4o judge is next; until then no answer-accuracy percentage appears here.
+**End-to-end LongMemEval-S** (retrieve → generate → judge — DeepSeek v4 Pro as both generator and judge, 470 questions, `topk_context=5`):
+
+```text
+condition   accuracy
+hybrid      96.8% (455/470)
+fts-only    83.6% (393/470)
+```
+
+Per-category, hybrid vs FTS-only (the delta shows where vector search earns its keep):
+
+| Question type | Hybrid | FTS-only | Delta |
+|---|---|---|---|
+| single-session-user (64) | 100.0% | 98.4% | +1.6pp |
+| single-session-assistant (56) | 98.2% | 67.9% | **+30.3pp** |
+| single-session-preference (30) | 96.7% | 80.0% | +16.7pp |
+| multi-session (121) | 92.6% | 72.7% | **+19.9pp** |
+| temporal-reasoning (127) | 97.6% | 88.2% | +9.4pp |
+| knowledge-update (72) | 98.6% | 94.4% | +4.2pp |
+
+The biggest lifts land on vocabulary-mismatch classes — `single-session-assistant` (+30pp) and `multi-session` (+20pp) — exactly where embeddings fix what FTS misses. Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness. Reproduce: see [`bench/longmemeval/phase4/`](bench/longmemeval/phase4/).
+
+Skipped deliberately: LOCOMO (publicly audited answer-key and judge problems) and DMR.
 
 ## Works well with Superpowers
 
