@@ -268,22 +268,24 @@ func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams() // DecayEnabled true
 
-	// Same fused score; fresh decision must beat stale decision.
+	// Fresh decision must beat stale decision at equal-ish fused scores.
 	fresh := Memory{ID: "fresh", Category: "decision", CreatedAt: "2026-07-10 00:00:00"} // 5 days
 	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days → floored
-	scores := map[string]float64{"fresh": 0.5, "stale": 0.5}
+	scores := map[string]float64{"fresh": 0.4, "stale": 0.5}
 
 	got := decayRank([]Memory{stale, fresh}, scores, p, 10, now)
 	if got[0].ID != "fresh" {
 		t.Errorf("decay should rank fresher first, got %v", ids(got))
 	}
 
-	// DecayEnabled false is a hard no-op: input order preserved.
+	// DecayEnabled false ranks by base score only: stale's higher base (0.5 vs
+	// 0.4) wins. (decayRank sorts by base in both modes — the fused path
+	// hydrates via GetByIDs, which does not preserve order.)
 	off := p
 	off.DecayEnabled = false
 	got = decayRank([]Memory{stale, fresh}, scores, off, 10, now)
 	if got[0].ID != "stale" {
-		t.Errorf("DecayEnabled=false must not reorder; got %v", ids(got))
+		t.Errorf("DecayEnabled=false must rank by base score, got %v", ids(got))
 	}
 
 	// Unparseable created_at treated as ancient (never spuriously wins).
