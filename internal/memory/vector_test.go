@@ -716,13 +716,14 @@ func ids(ms []Memory) []string {
 	return out
 }
 
-func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
+func TestApplyDecay_ReordersWindow(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams() // DecayEnabled true
 
-	// Fresh decision must beat stale decision at equal-ish fused scores.
+	// Within the window, decay reorders: fresh decision beats stale decision
+	// at equal-ish fused scores (decay-on multiplies the window by decay).
 	fresh := Memory{ID: "fresh", Category: "decision", CreatedAt: "2026-07-10 00:00:00"} // 5 days
-	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days → floored
+	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days
 	scores := map[string]float64{"fresh": 0.4, "stale": 0.5}
 
 	got := decayRank([]Memory{stale, fresh}, scores, p, 10, now)
@@ -748,23 +749,29 @@ func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
 	}
 }
 
-func TestApplyDecay_Membership(t *testing.T) {
+// TestApplyDecay_PreservesMembership is the regression guard for the
+// findability finding: truncation happens by base score ALONE, so decay
+// reorders within the window but can never drop a higher-base (more relevant)
+// memory below the cutoff. This is what keeps TestStalenessReport green.
+func TestApplyDecay_PreservesMembership(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams()
 
-	// Base scores put stale just above the cutoff; decay must drop it.
+	// stale has the higher base score (0.9 vs 0.5) but is heavily decayed;
+	// fresh is barely decayed but lower base. Decay must NOT let fresh displace
+	// stale from a limit-1 window — relevance (base) owns membership.
 	mems := []Memory{
 		{ID: "stale", Category: "dependency", CreatedAt: "2026-01-01 00:00:00"}, // 195 days → floored 0.15
 		{ID: "fresh", Category: "dependency", CreatedAt: "2026-07-14 00:00:00"}, // 1 day → ~0.97
 	}
 	scores := map[string]float64{"stale": 0.9, "fresh": 0.5}
 
-	// limit 1: without decay the stale memory (higher base) would win.
 	got := decayRank(mems, scores, p, 1, now)
-	if len(got) != 1 || got[0].ID != "fresh" {
-		t.Errorf("decay must change membership (fresh rescues the slot), got %v", ids(got))
+	if len(got) != 1 || got[0].ID != "stale" {
+		t.Errorf("decay must NOT change membership (base 0.9 > 0.5 owns the slot), got %v", ids(got))
 	}
 
+	// Same result with decay off (trivially base order).
 	off := p
 	off.DecayEnabled = false
 	got = decayRank(mems, scores, off, 1, now)
