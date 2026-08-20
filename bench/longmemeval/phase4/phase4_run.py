@@ -277,8 +277,12 @@ def _report(judged_path):
     if not rows:
         sys.exit(f"error: no rows in {judged_path}")
 
-    non_abstention = [r for r in rows if not r["abstention"]]
-    abstention = [r for r in rows if r["abstention"]]
+    # .get("abstention", False): legacy judged.jsonl rows written before the
+    # abstention feature have no abstention key — they're all non-abstention.
+    # cmd_judge can resume a partially-done legacy file (qid in done), so
+    # treating the missing key as a hard error would crash on those rows.
+    non_abstention = [r for r in rows if not r.get("abstention", False)]
+    abstention = [r for r in rows if r.get("abstention", False)]
 
     overall_labels = [1 if r["autoeval_label"] else 0 for r in rows]
     non_abstention_labels = [1 if r["autoeval_label"] else 0 for r in non_abstention]

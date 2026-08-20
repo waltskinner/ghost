@@ -294,6 +294,41 @@ def test_report_empty_abstention(capsys):
             assert "  Abstention:     0" in out
 
 
+def test_report_legacy_rows_without_abstention_key(capsys):
+    """Legacy judged.jsonl rows (pre-abstention, no abstention key) must not
+    crash _report: they are non-abstention. cmd_judge can resume a partially
+    done legacy file, so a mixed file (old + new rows) must also work."""
+    with mock.patch.dict(sys.modules, {
+        "run_generation": mock.MagicMock(),
+        "evaluate_qa": mock.MagicMock(),
+        "abstention_prompt": mock.MagicMock(),
+        "tiktoken": mock.MagicMock(),
+    }):
+        from phase4_run import _report
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "results.jsonl")
+            rows = [
+                # legacy rows: no abstention key at all
+                {"question_type": "fact", "autoeval_label": True},
+                {"question_type": "temporal", "autoeval_label": False},
+                # new-style row with the key
+                {"question_type": "fact", "abstention": True, "autoeval_label": True},
+            ]
+            _write_report_rows(path, rows)
+            _report(path)
+            out = capsys.readouterr().out
+
+            assert "blended 500-question" in out
+            # 2 legacy non-abstention rows
+            assert "Non-abstention: 2" in out
+            assert "Abstention:     1" in out
+            # blended 2/3, non-abstention 1/2, abstention 1/1
+            assert "0.6667" in out
+            assert "0.5000" in out
+            assert "1.0000" in out
+
+
 def test_report_empty_file():
     """Empty file should sys.exit."""
     with mock.patch.dict(sys.modules, {
