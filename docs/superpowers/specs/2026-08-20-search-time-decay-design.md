@@ -146,18 +146,28 @@ could regress recall on the graded dataset. Before merge:
 
 ### Bench fixture category fix (required)
 
-The staleness suite (`internal/bench/staleness.go:108`), the recency-trap
-suite (`internal/bench/recencytrap.go:88,99`), and the graded-bench
-perturbation test all seed `Category: "fact"`. Under the decay design,
-`fact` is a **never-decay** category (factor 1.0 always), so those suites
-cannot observe decay at all — they would pass/fail identically before and
-after this change, making the evaluation meaningless. Fix the fixtures:
+The staleness suite (`internal/bench/staleness.go:108`) seeds `Category: "fact"`
+for every version. Under the decay design, `fact` is a **never-decay** category
+(factor 1.0 always), so the suite cannot observe decay — it would pass/fail
+identically before and after this change, making the evaluation meaningless.
+Fix the fixtures:
 
-- Switch the staleness suite's seeded memories from `"fact"` to a decaying
-  category (`"decision"` or `"gotcha"`), so fresh-vs-stale lift is measurable.
-- Switch the recency-trap suite's correct/trap memories the same way, so a
-  stale-but-correct old memory's ability to outrank fresh traps is measurable
-  against decay.
+- **Staleness suite → `dependency`.** Its scenarios are updated deployment
+  facts ("prod runs Postgres 14 → migrated to 16") — semantically dependency
+  versions, and `dependency` is a decaying category (τ=30, floor 0.15). With
+  this change decay observably lifts the fresh version above its superseded
+  siblings. Change the hardcoded `Category: "fact"` at `staleness.go:108` to
+  `Category: "dependency"`.
+
+- **Recency-trap suite stays `fact` — deliberately.** Its semantic is the
+  mirror image: the OLD memory is the *correct* answer and fresh traps are
+  wrong (network magic, license, module path). If these were a decaying
+  category, decay would demote the correct old fact below fresh distractors and
+  the suite would fail by design — the exact failure the trap guards against.
+  Keeping it `fact` asserts the core safety property of category-aware decay:
+  it is inert on never-decay categories, so old-but-correct facts still win.
+  No change to `recencytrap.go`.
+
 - Re-run both suites under the new decay ranking and record the before/after
   numbers in the PR description. The suites' existing assertions
   (`TestStalenessReport`, `TestRecencyTrapAtDefault`) must still pass; the
@@ -169,12 +179,16 @@ The following tests sweep `SearchParams.RecencyWeight`, which is removed by
 this change, and their premises no longer hold:
 
 - `TestStalenessRecencyProof` (`staleness_test.go:103`) — replaces with a
-  decay-aware proof: with a `decision`/`gotcha`-category fixture, fresh-wins
-  under decay must exceed fresh-wins under no-decay, and reach a majority.
+  decay-aware proof: with the `dependency`-category fixture, fresh-wins under
+  decay must exceed fresh-wins under no-decay, and reach a majority.
 - `TestRecencyFrontier` (`recencytrap_test.go:51`) — the tradeoff curve
   (staleness-fresh vs trap-correct vs recency weight) becomes a decay-on/off
   comparison. Replace the weight sweep with a decay-enabled vs decay-disabled
-  sweep and record the frontier.
+  sweep over both suites and record the frontier. The trap suite stays `fact`
+  (never-decay), so its correct-wins should be **flat** under decay — that
+  flatness is the safety proof: category-awareness (vs the old blanket recency
+  prior) is what lets decay help staleness without hurting old-but-correct
+  facts.
 - `TestRecencyDoesNotPerturbGradedBench` (`staleness_test.go:145`) — asserts
   recency-on NDCG == recency-off NDCG because the graded dataset has uniform
   `created_at`. Replace with the equivalent claim that decay **cannot**
@@ -195,8 +209,8 @@ The `RecencyWeight`/`RecencyTau` field removal breaks compilation in
   `recencyRerank`'s truncate-first invariant (code unchanged)
 - `internal/memory/vector_test.go` — update `TestApplyRecency`; new decay tests
 - `internal/memory/store_test.go` (or new test file) — SQL-vs-Go parity test
-- `internal/bench/staleness.go` — switch seeded category to a decaying one
-- `internal/bench/recencytrap.go` — switch seeded category to a decaying one
+- `internal/bench/staleness.go` — switch seeded category `fact` → `dependency`
+- `internal/bench/recencytrap.go` — no change (stays `fact`, deliberately)
 - `internal/bench/staleness_test.go` — replace `TestStalenessRecencyProof`,
   `TestRecencyDoesNotPerturbGradedBench`
 - `internal/bench/recencytrap_test.go` — replace `TestRecencyFrontier`
