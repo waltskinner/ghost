@@ -82,10 +82,9 @@ type StalenessSummary struct {
 // and probes with Ghost's production search over the FTS path (no embedding
 // fixtures — the keyword path is where stale/fresh versions collide hardest,
 // since both match the fact's terms). The SearchParams are passed through to
-// SearchHybridParams so the recency prior can be swept: at the production
-// default (RecencyWeight 0) this measures today's behavior; with a recency
-// weight it measures whether the fresh version can be lifted above its
-// superseded siblings.
+// SearchHybridParams so the decay factor can be toggled: with DecayEnabled
+// false the suite measures pure relevance retrieval; with it on it measures
+// whether the fresh version is reordered above its stale siblings.
 func RunStaleness(ctx context.Context, scenarios []StalenessScenario, p memory.SearchParams, seedSupersedes bool) ([]ProbeOutcome, error) {
 	db, err := memory.OpenDB(":memory:")
 	if err != nil {

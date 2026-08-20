@@ -335,7 +335,7 @@ func ageDays(createdAt string, now time.Time) float64 {
 }
 
 // fuseAndRank runs the shared hybrid pipeline: RRF-fuse the two result legs,
-// then rank, truncate, and hydrate.
+// hydrate the candidate pool, then rank and truncate (inside decayRank).
 func (s *Store) fuseAndRank(ctx context.Context, ftsResults []Memory, vecResults []ScoredMemory, limit int, p SearchParams) ([]Memory, error) {
 	scores := make(map[string]float64)
 	idSet := make(map[string]bool)

@@ -48,21 +48,18 @@ func loadStalenessTestdata(t *testing.T) []StalenessScenario {
 	return scenarios
 }
 
-// TestStalenessReport runs the suite and logs the report. Per
-// docs/benchmarks.md this is REPORT-ONLY in CI: the suite documents that
-// search currently has no recency signal, so fresh-wins failures are printed,
-// never asserted. Scenarios graduate to enforced assertions as
-// supersedes-aware ranking ships. What IS enforced: the fixture loads with a
-// healthy scenario count, both probe types are present, the suite runs
-// without error, and the fresh version is at least RETRIEVED for every probe
-// (pure findability — recency plays no part in it).
+// TestStalenessReport runs the suite and logs the report. What IS enforced:
+// the fixture loads with a healthy scenario count, both probe types are
+// present, the suite runs without error, and the fresh version is at least
+// RETRIEVED for every probe under the production default (decay on) — decay
+// only reorders the window, never dropping a relevant memory (findability).
 func TestStalenessReport(t *testing.T) {
 	scenarios := loadStalenessTestdata(t)
 	if len(scenarios) < 20 {
 		t.Fatalf("fixture has %d scenarios, want >= 20", len(scenarios))
 	}
 
-	// Production defaults (RecencyWeight 0) — documents today's behavior.
+	// Production defaults (DecayEnabled true) — documents today's behavior.
 	outcomes, err := RunStaleness(context.Background(), scenarios, memory.DefaultSearchParams(), false)
 	if err != nil {
 		t.Fatalf("RunStaleness: %v", err)
