@@ -225,6 +225,7 @@ def cmd_generate(args):
 # --------------------------------------------------------------------------
 def cmd_judge(args):
     _, get_anscheck_prompt = import_official(args.longmemeval_src)
+    from abstention_prompt import get_abstention_prompt
     if args.api_base_url:
         key = get_key_openai_compat()
     else:
@@ -245,9 +246,14 @@ def cmd_judge(args):
                 continue
             e = meta[qid]
             abstention = qid.endswith("_abs")
-            prompt = get_anscheck_prompt(
-                e["question_type"], e["question"], e["answer"], h["hypothesis"],
-                abstention=abstention)
+
+            if abstention:
+                prompt = get_abstention_prompt(e["question"], h["hypothesis"])
+            else:
+                prompt = get_anscheck_prompt(
+                    e["question_type"], e["question"], e["answer"], h["hypothesis"],
+                    abstention=abstention)
+
             resp = chat(args.provider, args.model, key, prompt, 50,
                         api_base_url=args.api_base_url)
             label = "yes" in resp.lower()
