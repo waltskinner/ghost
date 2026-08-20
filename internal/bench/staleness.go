@@ -104,8 +104,11 @@ func RunStaleness(ctx context.Context, scenarios []StalenessScenario, p memory.S
 	for i, sc := range scenarios {
 		versionIDs[i] = make([]string, len(sc.Versions))
 		for j, v := range sc.Versions {
+			// The scenarios are updated deployment facts (dependency versions);
+			// seed them in a decaying category. Under "fact" (never-decay) the
+			// time-decay feature would be unobservable to this suite.
 			id, err := store.Create(ctx, project, memory.Memory{
-				Category: "fact", Content: v.Content, Importance: 0.7, Source: "mcp",
+				Category: "dependency", Content: v.Content, Importance: 0.7, Source: "mcp",
 			})
 			if err != nil {
 				return nil, fmt.Errorf("seed %s v%d: %w", sc.Name, j, err)
