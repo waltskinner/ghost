@@ -23,10 +23,11 @@ func loadTrapTestdata(t *testing.T) []TrapScenario {
 	return scenarios
 }
 
-// TestRecencyTrapAtDefault: with recency off (production default), the correct
+// TestRecencyTrapAtDefault: at the production default (decay on), the correct
 // old memory wins its trap scenarios — the FTS ranking already favors the
-// direct keyword match, and no recency demotes it. This is the invariant the
-// recency prior must not break.
+// direct keyword match, and because the trap fixtures are `fact` category
+// (never-decay), decay does not demote them. This is the invariant that makes
+// category-aware decay safe as a default.
 func TestRecencyTrapAtDefault(t *testing.T) {
 	scenarios := loadTrapTestdata(t)
 	if len(scenarios) < 12 {
@@ -44,7 +45,7 @@ func TestRecencyTrapAtDefault(t *testing.T) {
 	cw := TrapCorrectWins(outcomes)
 	t.Logf("trap correct-wins at default: %.3f", cw)
 	if cw < 0.9 {
-		t.Errorf("at default (no recency) the correct old memory should win nearly always, got %.3f", cw)
+		t.Errorf("at default the correct old memory should win nearly always (fact never decays), got %.3f", cw)
 	}
 }
 
