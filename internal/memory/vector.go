@@ -282,6 +282,27 @@ func parseCreatedAt(s string) time.Time {
 	return t
 }
 
+// decayFactor returns the category-aware time-decay multiplier for a memory
+// given its age in days. It mirrors DecayRankingSQL (store.go) exactly — a
+// pinned memory or a preference/convention/fact never decays (factor 1.0);
+// pattern/architecture decay with tau 45 and a 0.3 floor; all other categories
+// (decision, gotcha, dependency, ...) decay with tau 30 and a 0.15 floor. The
+// SQL-vs-Go parity test (store_test.go) guards against drift between this and
+// the SQL constant.
+func decayFactor(category string, pinned bool, ageDays float64) float64 {
+	if pinned {
+		return 1.0
+	}
+	switch category {
+	case "preference", "convention", "fact":
+		return 1.0
+	case "pattern", "architecture":
+		return math.Max(0.3, 1.0/(1.0+ageDays/45.0))
+	default:
+		return math.Max(0.15, 1.0/(1.0+ageDays/30.0))
+	}
+}
+
 // fuseAndRank runs the shared hybrid pipeline: RRF-fuse the two result legs,
 // then rank, truncate, and hydrate.
 func (s *Store) fuseAndRank(ctx context.Context, ftsResults []Memory, vecResults []ScoredMemory, limit int, p SearchParams) ([]Memory, error) {

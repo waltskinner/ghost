@@ -7,6 +7,36 @@ import (
 	"time"
 )
 
+func TestDecayFactor_MatchesSQLSemantics(t *testing.T) {
+	cases := []struct {
+		category string
+		pinned   bool
+		ageDays  float64
+		want     float64
+	}{
+		{"decision", false, 0, 1.0},                    // brand new → no decay
+		{"decision", false, 30, 0.5},                   // tau=30: 1/(1+30/30)
+		{"gotcha", false, 30, 0.5},                     // same tier as decision
+		{"dependency", false, 90, 0.25},                // tau=30: 1/(1+90/30), above 0.15 floor
+		{"pattern", false, 45, 0.5},                    // tau=45: 1/(1+45/45)
+		{"architecture", false, 100, 45.0 / 145.0},     // tau=45: 1/(1+100/45), above 0.3 floor
+		{"preference", false, 1000, 1.0},               // never decays
+		{"convention", false, 1000, 1.0},               // never decays
+		{"fact", false, 1000, 1.0},                     // never decays
+		{"decision", true, 1000, 1.0},                  // pinned → exempt
+		{"gotcha", true, 30, 1.0},                      // pinned beats decay
+		{"decision", false, -5, 1.2},                   // negative age: SQL doesn't clamp, factor > 1
+	}
+	const eps = 1e-9
+	for _, c := range cases {
+		got := decayFactor(c.category, c.pinned, c.ageDays)
+		if math.Abs(got-c.want) > eps {
+			t.Errorf("decayFactor(%q, pinned=%v, age=%.1f) = %v, want %v",
+				c.category, c.pinned, c.ageDays, got, c.want)
+		}
+	}
+}
+
 // --- float32sToBytes / bytesToFloat32s roundtrip tests ---
 
 func TestVectorRoundtrip_Empty(t *testing.T) {
