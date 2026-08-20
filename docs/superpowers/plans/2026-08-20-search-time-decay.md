@@ -146,7 +146,7 @@ func TestDecaySQLParity(t *testing.T) {
 		for _, age := range ages {
 			for _, pinned := range []bool{false, true} {
 				id, err := s.Create(ctx, testProject, Memory{
-					Category: cat, Content: cat, Source: "parity",
+					Category: cat, Content: cat, Source: "manual", // "manual" per the source CHECK constraint (schema.go)
 					Importance: 1.0, // importance must be 1 so the SQL result IS the factor
 				})
 				if err != nil {
