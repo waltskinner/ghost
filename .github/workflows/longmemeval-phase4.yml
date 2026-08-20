@@ -1,0 +1,210 @@
+name: longmemeval-phase4
+
+# Phase 4 end-to-end LongMemEval-S benchmark: retrieve → generate → judge.
+# Manual-only — runs LLM API calls that cost money. Requires OPENCODE_API_KEY
+# secret (or OPENAI_API_KEY / ANTHROPIC_API_KEY) in repo settings.
+#
+# Usage: Actions → longmemeval-phase4 → Run workflow → pick condition + model
+
+on:
+  workflow_dispatch:
+    inputs:
+      condition:
+        description: "Retrieval condition"
+        required: false
+        default: fts
+        type: choice
+        options:
+          - fts
+          - hybrid
+      provider:
+        description: "LLM provider"
+        required: false
+        default: openai
+        type: choice
+        options:
+          - openai
+          - anthropic
+      model:
+        description: "Model ID (e.g. deepseek-v4-pro, gpt-4o)"
+        required: false
+        default: deepseek-v4-pro
+      api_base_url:
+        description: "API base URL (leave blank for provider default)"
+        required: false
+        default: ""
+      max_questions:
+        description: "Max questions (0=all, positive=int for smoke test)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+env:
+  DATASET_URL: https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+
+jobs:
+  phase4:
+    name: "Phase 4: ${{ inputs.condition }} / ${{ inputs.model }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set cache paths
+        run: |
+          echo "DATASET_PATH=$HOME/.cache/ghost-bench/longmemeval_s_cleaned.json" >> "$GITHUB_ENV"
+          echo "EMBED_CACHE_PATH=$HOME/.cache/ghost-bench/embed-cache.jsonl" >> "$GITHUB_ENV"
+
+      - name: Restore LongMemEval-S dataset cache
+        id: cache-dataset
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DATASET_PATH }}
+          key: longmemeval-s-cleaned-v1
+
+      - name: Download dataset (cache miss)
+        if: steps.cache-dataset.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$DATASET_PATH")"
+          curl -fL --retry 3 --retry-delay 5 -o "$DATASET_PATH" "$DATASET_URL"
+
+      - name: Restore embedding cache
+        if: inputs.condition == 'hybrid'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.EMBED_CACHE_PATH }}
+          key: longmemeval-embed-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            longmemeval-embed-cache-v1-
+
+      - name: Install Ollama (hybrid only)
+        if: inputs.condition == 'hybrid'
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama (hybrid only)
+        if: inputs.condition == 'hybrid'
+        run: |
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "ollama serve did not become ready in time"; cat /tmp/ollama.log; exit 1
+
+      - name: Pull embedding model (hybrid only)
+        if: inputs.condition == 'hybrid'
+        run: ollama pull nomic-embed-text:v1.5
+
+      - name: Install Python dependencies
+        run: pip install tiktoken tqdm openai backoff transformers numpy
+
+      - name: Clone LongMemEval repo (official prompts)
+        run: |
+          git clone --depth 1 https://github.com/xiaowu0162/LongMemEval .cache/LongMemEval
+
+      - name: Run Phase 1 retrieval
+        run: |
+          RETRIEVAL_ARGS=""
+          if [ "${{ inputs.condition }}" = "hybrid" ]; then
+            RETRIEVAL_ARGS="-ollama http://localhost:11434 -embed-cache $EMBED_CACHE_PATH"
+          fi
+          go run ./bench/longmemeval \
+            -data "$DATASET_PATH" \
+            -condition ${{ inputs.condition }} \
+            --include-abstention \
+            $RETRIEVAL_ARGS \
+            -retrieval-out ranked.jsonl
+
+      - name: Merge retrieval into dataset
+        run: |
+          python bench/longmemeval/phase4/merge_retrieval.py \
+            --dataset "$DATASET_PATH" \
+            --retrieval ranked.jsonl \
+            --out merged.json
+
+      - name: Filter questions (smoke test)
+        if: inputs.max_questions != '0'
+        run: |
+          python -c "
+          import json
+          data = json.load(open('merged.json'))
+          n = int('${{ inputs.max_questions }}')
+          json.dump(data[:n], open('merged.json', 'w'))
+          print(f'Filtered to {n} questions')
+          "
+
+      - name: Determine API key
+        id: api-key
+        run: |
+          if [ -n "${{ secrets.OPENCODE_API_KEY }}" ]; then
+            echo "key_name=OPENCODE_API_KEY" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "key_name=OPENAI_API_KEY" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "key_name=ANTHROPIC_API_KEY" >> "$GITHUB_OUTPUT"
+          else
+            echo "No API key found in secrets"; exit 1
+          fi
+
+      - name: Generate hypotheses
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          API_BASE=""
+          if [ -n "${{ inputs.api_base_url }}" ]; then
+            API_BASE="--api-base-url ${{ inputs.api_base_url }}"
+          fi
+          python bench/longmemeval/phase4/phase4_run.py generate \
+            --provider ${{ inputs.provider }} \
+            --model ${{ inputs.model }} \
+            --longmemeval-src .cache/LongMemEval/src \
+            $API_BASE \
+            --dataset merged.json \
+            --out hyp.jsonl
+
+      - name: Judge hypotheses
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          API_BASE=""
+          if [ -n "${{ inputs.api_base_url }}" ]; then
+            API_BASE="--api-base-url ${{ inputs.api_base_url }}"
+          fi
+          python bench/longmemeval/phase4/phase4_run.py judge \
+            --provider ${{ inputs.provider }} \
+            --model ${{ inputs.model }} \
+            --longmemeval-src .cache/LongMemEval/src \
+            $API_BASE \
+            --dataset merged.json \
+            --hyp hyp.jsonl
+
+      - name: Save embedding cache
+        if: inputs.condition == 'hybrid' && always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.EMBED_CACHE_PATH }}
+          key: longmemeval-embed-cache-v1-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "phase4-${{ inputs.condition }}-${{ inputs.model }}"
+          path: |
+            hyp.jsonl
+            hyp.jsonl.eval-results-${{ inputs.model }}
+            ranked.jsonl

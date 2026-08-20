@@ -44,8 +44,6 @@ def main():
     counts = defaultdict(int)
     for entry in dataset:
         qid = entry["question_id"]
-        if qid.endswith("_abs"):
-            continue  # abstention: excluded from retrieval scoring, skip
         if qid not in ranked:
             missing_ret += 1
             continue
