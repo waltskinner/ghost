@@ -27,6 +27,7 @@ var exampleConfig []byte
 // Config holds the global ghost configuration.
 type Config struct {
 	API        APIConfig        `koanf:"api"`
+	CLI        CLIConfig        `koanf:"cli"`
 	Embedding  EmbeddingConfig  `koanf:"embedding"`
 	Reflection ReflectionConfig `koanf:"reflection"`
 	Linking    LinkingConfig    `koanf:"linking"`
@@ -38,10 +39,22 @@ type APIConfig struct {
 	Key string `koanf:"key"`
 }
 
+// CLIConfig holds explicit paths to the subprocess LLM binaries backing the
+// reflect CLI tier. An empty value means "resolve from PATH"; a set path
+// overrides PATH lookup. This matters for auto_reflect: the Stop hook process's
+// PATH is often not the interactive shell's, so a binary installed under
+// ~/.opencode/bin (or similar) is invisible to exec.LookPath unless its path is
+// configured explicitly here.
+type CLIConfig struct {
+	ClaudeBinary   string `koanf:"claude_binary"`
+	OpenCodeBinary string `koanf:"opencode_binary"`
+}
+
 // ReflectionConfig holds memory consolidation settings.
 type ReflectionConfig struct {
 	AutoResolve   bool `koanf:"auto_resolve"`
 	AutoSupersede bool `koanf:"auto_supersede"`
+	AutoReflect   bool `koanf:"auto_reflect"`
 }
 
 // EmbeddingConfig holds local embedding settings.
@@ -75,6 +88,9 @@ var defaults = map[string]interface{}{
 	"embedding.dimensions":       768,
 	"reflection.auto_resolve":    false,
 	"reflection.auto_supersede":  false,
+	"reflection.auto_reflect":    false,
+	"cli.claude_binary":          "",
+	"cli.opencode_binary":        "",
 	"linking.enabled":            true,
 	"linking.threshold":          0.70,
 	"linking.demotion_threshold": 0.90,
@@ -124,7 +140,12 @@ func Load() (*Config, error) {
 	// koanf's _ → . transformer would map e.g. GHOST_OBSIDIAN_VAULT_DIR
 	// to obsidian.vault.dir instead of obsidian.vault_dir.
 	envOverrides := map[string]string{
-		"GHOST_OBSIDIAN_VAULT_DIR": "obsidian.vault_dir",
+		"GHOST_OBSIDIAN_VAULT_DIR":        "obsidian.vault_dir",
+		"GHOST_CLI_CLAUDE_BINARY":         "cli.claude_binary",
+		"GHOST_CLI_OPENCODE_BINARY":       "cli.opencode_binary",
+		"GHOST_REFLECTION_AUTO_REFLECT":   "reflection.auto_reflect",
+		"GHOST_REFLECTION_AUTO_RESOLVE":   "reflection.auto_resolve",
+		"GHOST_REFLECTION_AUTO_SUPERSEDE": "reflection.auto_supersede",
 	}
 	for envKey, koanfKey := range envOverrides {
 		if val := os.Getenv(envKey); val != "" {

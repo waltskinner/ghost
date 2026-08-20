@@ -266,7 +266,7 @@ func resolveProjectOrExit(ctx context.Context, store *memory.Store, projectName 
 // Use --restore to undo the last consolidation from snapshot.
 func runReflect() {
 	var projectName, tierValue string
-	var apply, restore bool
+	var apply, restore, requireLLM bool
 	tierValue = "auto"
 	for i := 2; i < len(os.Args); i++ {
 		switch {
@@ -279,6 +279,8 @@ func runReflect() {
 			apply = true
 		case os.Args[i] == "--restore":
 			restore = true
+		case os.Args[i] == "--require-llm":
+			requireLLM = true
 		case !strings.HasPrefix(os.Args[i], "-"):
 			projectName = os.Args[i]
 		}
@@ -287,9 +289,10 @@ func runReflect() {
 		fmt.Fprintln(os.Stderr, `Usage: ghost reflect <project> [flags]
 
 Flags:
-  --tier string   Consolidation tier: auto, haiku, cli, sqlite (default "auto")
+  --tier string   Consolidation tier: auto, haiku, cli, opencode, sqlite (default "auto")
   --apply         Save results (default is dry-run/preview only)
-  --restore       Undo the last consolidation from snapshot`)
+  --restore       Undo the last consolidation from snapshot
+  --require-llm   Fail instead of falling back to the Jaccard-only sqlite tier`)
 		os.Exit(1)
 	}
 
@@ -320,12 +323,38 @@ Flags:
 		client := ai.NewClient(cfg.API.Key, logger)
 		consolidator = reflection.NewHaikuConsolidator(client)
 	case "cli":
-		if _, err := exec.LookPath("claude"); err != nil {
-			fmt.Fprintln(os.Stderr, "error: cli tier requires the `claude` binary on PATH")
+		binary := "claude"
+		if cfg.CLI.ClaudeBinary != "" {
+			binary = cfg.CLI.ClaudeBinary
+		}
+		if _, err := exec.LookPath(binary); err != nil {
+			hint := "set cli.claude_binary"
+			if cfg.CLI.ClaudeBinary != "" {
+				hint = "check that cli.claude_binary (" + binary + ") is a valid, executable path"
+			}
+			fmt.Fprintf(os.Stderr, "error: cli tier requires the `%s` binary on PATH (or %s)\n", binary, hint)
 			os.Exit(1)
 		}
-		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClient(), "cli")
+		consolidator = reflection.NewNamedConsolidator(ai.NewCLIClientWithBinary(binary), "cli")
+	case "opencode":
+		binary := "opencode"
+		if cfg.CLI.OpenCodeBinary != "" {
+			binary = cfg.CLI.OpenCodeBinary
+		}
+		if _, err := exec.LookPath(binary); err != nil {
+			hint := "set cli.opencode_binary"
+			if cfg.CLI.OpenCodeBinary != "" {
+				hint = "check that cli.opencode_binary (" + binary + ") is a valid, executable path"
+			}
+			fmt.Fprintf(os.Stderr, "error: opencode tier requires the `%s` binary on PATH (or %s)\n", binary, hint)
+			os.Exit(1)
+		}
+		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClientWithBinary(binary), "opencode")
 	case "sqlite":
+		if requireLLM {
+			fmt.Fprintln(os.Stderr, "error: --require-llm conflicts with --tier sqlite")
+			os.Exit(1)
+		}
 		consolidator = reflection.NewSQLiteConsolidator()
 	default: // "auto"
 		var tiers []reflection.Consolidator
@@ -333,10 +362,19 @@ Flags:
 			client := ai.NewClient(cfg.API.Key, logger)
 			tiers = append(tiers, reflection.NewHaikuConsolidator(client))
 		}
-		if _, err := exec.LookPath("claude"); err == nil {
-			tiers = append(tiers, reflection.NewNamedConsolidator(ai.NewCLIClient(), "cli"))
+		if cli := ai.NewCLIProviderWithBinaries(cfg.CLI.ClaudeBinary, cfg.CLI.OpenCodeBinary); cli.Available() {
+			tiers = append(tiers, reflection.NewNamedConsolidator(cli, cli.Name()))
 		}
-		tiers = append(tiers, reflection.NewSQLiteConsolidator())
+		// --require-llm is the autonomous-reflect guard: it must never silently
+		// degrade to the Jaccard-only sqlite tier (which would rewrite every
+		// non-manual memory with no consolidation quality). A stale/exhausted
+		// ANTHROPIC_API_KEY is a false positive for "has an LLM", so the cheap
+		// stop-hook pre-check can't be trusted; this flag is the real guard at
+		// the write site — no LLM tier available (or all fail) => exit non-zero
+		// without touching the DB.
+		if !requireLLM {
+			tiers = append(tiers, reflection.NewSQLiteConsolidator())
+		}
 		consolidator = reflection.NewTieredConsolidator(tiers, logger)
 	}
 
@@ -368,15 +406,33 @@ Flags:
 		fmt.Fprintf(os.Stderr, "error: get memories: %v\n", err)
 		os.Exit(1)
 	}
+	// Resolved-evidence memories are excluded from consolidation input: ghost
+	// resolve de-weighted them and they must survive reflect untouched, not be
+	// re-emitted as fresh unresolved duplicates by the consolidator (see issue
+	// #318). ReplaceNonManual independently excludes them from its delete, so
+	// they are never touched either way.
+	live := make([]memory.Memory, 0, len(existingMemories))
+	resolvedCount := 0
+	for _, m := range existingMemories {
+		if m.ResolvedAt != nil {
+			resolvedCount++
+			continue
+		}
+		live = append(live, m)
+	}
 	currentContext, _ := store.GetLearnedContext(ctx, projectID)
 	exchanges, _ := store.GetRecentExchanges(ctx, projectID, 15)
 
-	fmt.Printf("Memories:     %d existing\n", len(existingMemories))
+	if resolvedCount > 0 {
+		fmt.Printf("Memories:     %d existing (%d resolved, excluded from consolidation)\n", len(existingMemories), resolvedCount)
+	} else {
+		fmt.Printf("Memories:     %d existing\n", len(existingMemories))
+	}
 	fmt.Println("Running consolidation...")
 
 	input := reflection.ReflectionInput{
 		RecentExchanges:  exchanges,
-		ExistingMemories: existingMemories,
+		ExistingMemories: live,
 		CurrentContext:   currentContext,
 		ProjectName:      projectName,
 	}
@@ -446,7 +502,7 @@ Flags:
 	}
 
 	var existingNonManual int
-	for _, m := range existingMemories {
+	for _, m := range live {
 		if m.Source != "manual" {
 			existingNonManual++
 		}
@@ -1094,15 +1150,17 @@ Commands:
   version                     Print version
 
 Flags (reflect):
-  --tier string   Consolidation tier: auto, haiku, cli, sqlite (default "auto")
+  --tier string   Consolidation tier: auto, haiku, cli, opencode, sqlite (default "auto")
   --apply         Save results
   --restore       Undo last consolidation
 
 Environment:
-  ANTHROPIC_API_KEY           Required for reflect --tier haiku. supersede/resolve and
-                              reflect --tier cli/auto fall back to a subscription-billed
-                              'claude' CLI call (requires the 'claude' binary on PATH)
-                              when unset or exhausted.
+  ANTHROPIC_API_KEY           Required for reflect --tier haiku. supersede/resolve fall
+                              back to a subscription-billed 'claude' CLI call (requires
+                              the 'claude' binary on PATH); reflect --tier auto falls
+                              back to 'claude' or 'opencode' (whichever is on PATH),
+                              and --tier cli/opencode require their respective binary.
+                              All when unset or exhausted.
   GHOST_DEBUG                 Enable debug logging
 `, version)
 }

@@ -36,9 +36,20 @@
 #                              # injection; stricter than threshold since
 #                              # "related" isn't the same bar as "redundant"
 
+# --- Subprocess LLM binaries (reflect CLI tier) ---
+# The reflect CLI tier shells out to `claude -p` or `opencode run`. By default
+# the binaries are resolved from PATH; set these to explicit paths when they live
+# somewhere not on the Stop hook process's PATH (e.g. ~/.opencode/bin is often
+# only added to interactive shells). Without this, auto_reflect silently never
+# fires even when the binary is installed.
+# cli:
+#   claude_binary: ""                 # e.g. "/opt/homebrew/bin/claude"
+#   opencode_binary: ""               # e.g. "/Users/you/.opencode/bin/opencode"
+
 # --- Memory Consolidation ---
 # ghost reflect's tier is chosen via the --tier CLI flag, not config.
 # reflection:
+#   auto_reflect: false               # run ghost reflect --apply automatically on session stop
 #   auto_resolve: false               # run ghost resolve automatically after reflect
 
 # --- Obsidian Vault Mirror ---

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/wcatz/ghost/internal/ai"
 	"github.com/wcatz/ghost/internal/config"
 	"github.com/wcatz/ghost/internal/memory"
 )
@@ -54,11 +55,12 @@ const stopBlockMessage = `{"decision":"block","reason":"This session used tools 
 // It blocks the stop once — via {"decision":"block"} on stdout — when the
 // session used tools but never saved anything to Ghost. Every failure path
 // returns silently, allowing the stop: the hook must never trap a session.
-// The one exception to "no DB/LLM work on this path" is spawnResolveIfConfigured
-// (and, following the identical exception pattern, spawnSupersedeIfConfigured),
-// which — best-effort, opt-in only — does a small synchronous read-only lookup
-// (config + a project-ID query) before forking a detached `ghost resolve --apply`
-// (respectively `ghost supersede --apply`) and returning immediately without
+// The one exception to "no DB/LLM work on this path" is the three spawn
+// helpers — spawnResolveIfConfigured, spawnSupersedeIfConfigured, and
+// spawnReflectIfConfigured — which, best-effort, opt-in only, do a small
+// synchronous read-only lookup (config + a project-ID query) before forking a
+// detached `ghost resolve --apply` / `ghost supersede --apply` /
+// `ghost reflect --apply --require-llm` and returning immediately without
 // waiting on it; no LLM call and no write ever happens inline here, only in the
 // detached child.
 func HandleStopHook(stdin io.Reader, stdout io.Writer) {
@@ -77,6 +79,7 @@ func HandleStopHook(stdin io.Reader, stdout io.Writer) {
 
 	spawnResolveIfConfigured(input.CWD)
 	spawnSupersedeIfConfigured(input.CWD)
+	spawnReflectIfConfigured(input.CWD)
 
 	if input.TranscriptPath == "" {
 		return
@@ -265,6 +268,80 @@ func spawnSupersedeIfConfigured(cwd string) {
 	defer logFile.Close() //nolint:errcheck
 
 	cmd := exec.Command(exe, "supersede", projectName, "--apply")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	detachProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	token, haveToken := processStartTime(cmd.Process.Pid)
+	_ = atomicWritePID(pidPath, cmd.Process.Pid, token, haveToken)
+	_ = cmd.Process.Release()
+}
+
+// spawnReflectIfConfigured starts `ghost reflect <project> --apply` as a
+// detached background process for the project matching cwd, if one isn't
+// already running for that project. Opt-in via reflection.auto_reflect
+// (default false). Every failure path returns silently: this must never block
+// or fail the stop hook.
+//
+// Unlike the resolve/supersede twins, this adds a no-LLM guard: consolidation
+// is only worth an unattended write when a real LLM tier is available. Without
+// an API key or a claude/opencode binary, --tier auto would fall through to the
+// Jaccard-only sqlite tier and rewrite every non-manual memory for no quality
+// gain, so the spawn is skipped entirely — before the DB is even opened, so
+// this stays a cheap read-only no-op.
+func spawnReflectIfConfigured(cwd string) {
+	if cwd == "" {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil || !cfg.Reflection.AutoReflect {
+		return
+	}
+	if cfg.API.Key == "" && !ai.NewCLIProviderWithBinaries(cfg.CLI.ClaudeBinary, cfg.CLI.OpenCodeBinary).Available() {
+		return
+	}
+
+	dataDir, err := config.DataDir()
+	if err != nil {
+		return
+	}
+	dbPath := filepath.Join(dataDir, "ghost.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return
+	}
+	db, err := sql.Open("sqlite", roDSN(dbPath))
+	if err != nil {
+		return
+	}
+	defer db.Close() //nolint:errcheck
+
+	store := memory.NewStore(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	projectID, projectName, err := store.ResolveProject(context.Background(), cwd)
+	if err != nil || projectID == "" || projectName == "" {
+		return
+	}
+
+	pidPath := filepath.Join(dataDir, "reflect-"+projectID+".pid")
+	if isAlive(pidPath) {
+		return
+	}
+	if !claimPidFile(pidPath) {
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	logFile, err := os.OpenFile(filepath.Join(dataDir, "reflect.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer logFile.Close() //nolint:errcheck
+
+	cmd := exec.Command(exe, "reflect", projectName, "--apply", "--require-llm")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	detachProcess(cmd)

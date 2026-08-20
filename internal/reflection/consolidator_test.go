@@ -357,8 +357,9 @@ func TestTieredConsolidator_QualityGateRejectsGarbage(t *testing.T) {
 	}
 }
 
-func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
-	// Even if the last tier returns few memories, it's accepted (no fallback available).
+func TestTieredConsolidator_QualityGateAcceptsMechanicalTier(t *testing.T) {
+	// The mechanical fallback (SQLite) is accepted even when it returns few
+	// memories — it's deterministic, it can't truncate or hallucinate.
 	inputMems := make([]memory.Memory, 10)
 	for i := range inputMems {
 		inputMems[i] = memory.Memory{Category: "fact", Content: "memory", Importance: 0.7}
@@ -367,6 +368,7 @@ func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
 	sparse := &stubConsolidator{
 		name:      "sqlite",
 		available: true,
+		mechanical: true,
 		result: ReflectionResult{
 			LearnedContext: "sparse-ctx",
 			Memories: []ReflectMemory{
@@ -381,7 +383,36 @@ func TestTieredConsolidator_QualityGateAcceptsLastTier(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.LearnedContext != "sparse-ctx" {
-		t.Errorf("expected last tier accepted regardless, got %q", result.LearnedContext)
+		t.Errorf("expected mechanical tier accepted regardless, got %q", result.LearnedContext)
+	}
+}
+
+func TestTieredConsolidator_QualityGateRejectsLastLLMTier(t *testing.T) {
+	// wcatz round-2 finding: with --require-llm the sqlite tier is omitted from
+	// the auto list, so the LAST tier is a real LLM (cli). It must NOT be exempt
+	// from the quality gate merely because it's last — truncated/hallucinated
+	// output would otherwise be silently applied and ReplaceNonManual would
+	// delete the other live memories.
+	inputMems := make([]memory.Memory, 10)
+	for i := range inputMems {
+		inputMems[i] = memory.Memory{Category: "fact", Content: "memory", Importance: 0.7}
+	}
+
+	sparseLLM := &stubConsolidator{
+		name:      "cli",
+		available: true,
+		result: ReflectionResult{
+			LearnedContext: "truncated-ctx",
+			Memories: []ReflectMemory{
+				{Category: "fact", Content: "only-one", Importance: 0.5, Tags: []string{}},
+			},
+		},
+	}
+
+	tc := NewTieredConsolidator([]Consolidator{sparseLLM}, slog.Default())
+	_, err := tc.Consolidate(context.Background(), ReflectionInput{ExistingMemories: inputMems})
+	if err == nil {
+		t.Fatal("expected error: last-tier LLM must be rejected by the quality gate")
 	}
 }
 
@@ -414,6 +445,117 @@ func TestTieredConsolidator_QualityGateSkipsSmallInput(t *testing.T) {
 	}
 }
 
+func TestSQLiteConsolidator_SubsetMergesViaContainment(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "use sqlite", Importance: 0.6},
+			{Category: "fact", Content: "use sqlite for storage with fts5 search", Importance: 0.8},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 1 {
+		t.Fatalf("expected subset to merge into superset, got %d memories", len(result.Memories))
+	}
+	if result.Memories[0].Importance != 0.8 {
+		t.Errorf("merged memory should keep higher importance 0.8, got %v", result.Memories[0].Importance)
+	}
+}
+
+func TestSQLiteConsolidator_NumericDifferenceBlocksMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "k3s runs grafana on port 80", Importance: 0.7},
+			{Category: "fact", Content: "k3s runs grafana on port 81", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected numeric difference to block merge, got %d memories", len(result.Memories))
+	}
+}
+
+// TestSQLiteConsolidator_SingleDigitNumericDifferenceBlocksMerge guards the
+// single-character token case: "port 8" vs "port 9" must differ even though the
+// numeric tokens are length one and would be dropped by the len>1 filter alone.
+func TestSQLiteConsolidator_SingleDigitNumericDifferenceBlocksMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "preprod network magic is 1", Importance: 0.7},
+			{Category: "fact", Content: "preprod network magic is 2", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected single-digit numeric difference to block merge, got %d memories", len(result.Memories))
+	}
+}
+
+// TestSQLiteConsolidator_PartialContainmentDoesNotMerge guards the containment
+// over-merge: two distinct facts that share a common word ("deploy staging" vs
+// "deploy production") have containment 0.5 and must NOT merge. Only full
+// subsumption (containment 1.0) triggers the containment merge.
+func TestSQLiteConsolidator_PartialContainmentDoesNotMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "deploy to staging", Importance: 0.7},
+			{Category: "fact", Content: "deploy to production", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected partial containment to NOT merge, got %d memories", len(result.Memories))
+	}
+}
+
+func TestTokenize_RetainsSingleDigitNumericTokens(t *testing.T) {
+	tokens := tokenize("port 8 and port 9")
+	if !tokens["8"] || !tokens["9"] {
+		t.Errorf("single-digit numeric tokens should be retained, got %v", tokens)
+	}
+	if tokens["a"] {
+		t.Error("single-char letters should still be dropped")
+	}
+}
+
+func TestTokenize_ExcludesStopwords(t *testing.T) {
+	tokens := tokenize("ghost uses sqlite for the storage with fts5")
+	if tokens["the"] || tokens["for"] || tokens["with"] {
+		t.Errorf("stopwords should be excluded, got %v", tokens)
+	}
+	if !tokens["ghost"] || !tokens["sqlite"] || !tokens["storage"] {
+		t.Errorf("content words should be kept, got %v", tokens)
+	}
+}
+
+func TestContainment(t *testing.T) {
+	a := map[string]bool{"go": true, "sqlite": true}
+	b := map[string]bool{"go": true, "sqlite": true, "fts5": true, "storage": true}
+	if got := containment(a, b); got != 1.0 {
+		t.Errorf("containment(subset, superset) = %v, want 1.0", got)
+	}
+	c := map[string]bool{"go": true}
+	d := map[string]bool{"sqlite": true}
+	if got := containment(c, d); got != 0.0 {
+		t.Errorf("containment(disjoint) = %v, want 0.0", got)
+	}
+}
+
 func TestHaikuConsolidator_NilClient(t *testing.T) {
 	h := NewHaikuConsolidator(nil)
 	if h.Available(context.Background()) {
@@ -426,12 +568,14 @@ func TestHaikuConsolidator_NilClient(t *testing.T) {
 type stubConsolidator struct {
 	name      string
 	available bool
+	mechanical bool
 	result    ReflectionResult
 	err       error
 }
 
 func (s *stubConsolidator) Name() string                     { return s.name }
 func (s *stubConsolidator) Available(_ context.Context) bool { return s.available }
+func (s *stubConsolidator) Mechanical() bool                 { return s.mechanical }
 func (s *stubConsolidator) Consolidate(_ context.Context, _ ReflectionInput) (ReflectionResult, error) {
 	return s.result, s.err
 }
