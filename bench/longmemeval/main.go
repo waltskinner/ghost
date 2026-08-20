@@ -207,6 +207,7 @@ func main() {
 	ollamaURL := flag.String("ollama", "http://localhost:11434", "Ollama URL for vector/hybrid")
 	embedCache := flag.String("embed-cache", "", "append-only embedding cache JSONL (vector/hybrid)")
 	floorsSpec := flag.String("floors", "", "comma-separated metric=min floors over OVERALL metrics, e.g. \"r5=0.74,ndcg10=0.72\" (keys: r1, r5, r10, mrr10, ndcg10)")
+	includeAbstention := flag.Bool("include-abstention", false, "include abstention questions in Phase 1 scoring (not recommended for IR metrics)")
 	flag.Parse()
 
 	// Parse -floors before any other validation: an unknown key or malformed
@@ -272,7 +273,7 @@ func main() {
 	scored, skippedAbstention := 0, 0
 
 	for _, q := range questions {
-		if isAbstention(q.QuestionID) {
+		if isAbstention(q.QuestionID) && !*includeAbstention {
 			skippedAbstention++
 			continue
 		}
@@ -339,8 +340,10 @@ func main() {
 		printAgg(name, byType[name])
 	}
 	printAgg("OVERALL", overall)
-	fmt.Printf("\n%d questions scored (%d abstention excluded). Wall clock %s.\n",
-		scored, skippedAbstention, time.Since(start).Round(time.Second))
+	fmt.Printf("\n%d questions scored (%d abstention %s). Wall clock %s.\n",
+		scored, skippedAbstention,
+		map[bool]string{false: "excluded", true: "included"}[*includeAbstention],
+		time.Since(start).Round(time.Second))
 	if embedder != nil {
 		hits, misses := embedder.Stats()
 		fmt.Printf("Embedding cache: %d hits, %d computed.\n", hits, misses)

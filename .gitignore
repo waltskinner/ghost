@@ -38,3 +38,9 @@ vendor/
 .env
 .env.*
 .worktrees/
+
+# Benchmark artifacts (local runs)
+ranked*.jsonl
+hyp*.jsonl
+merged*.json
+*.eval-results-*

@@ -4,5 +4,5 @@ __pycache__/
 
 # Local run artifacts (never commit generated data / hypotheses / judged logs)
 *.jsonl
-merged.json
+merged*.json
 venv/
