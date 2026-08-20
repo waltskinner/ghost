@@ -88,7 +88,7 @@ func hasGhostID(path string) (string, bool) {
 // in its frontmatter — the signature of a Ghost-managed note.
 func hasGhostContent(dir string) bool {
 	var found bool
-	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
 			return nil
 		}
@@ -98,6 +98,9 @@ func hasGhostContent(dir string) bool {
 		}
 		return nil
 	})
+	if err != nil {
+		return false // can't scan — preserve the folder
+	}
 	return found
 }
 
