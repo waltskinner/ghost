@@ -716,34 +716,60 @@ func ids(ms []Memory) []string {
 	return out
 }
 
-func TestApplyRecency(t *testing.T) {
+func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
+	now := timeMustParse("2026-07-15 00:00:00")
+	p := DefaultSearchParams() // DecayEnabled true
+
+	// Fresh decision must beat stale decision at equal-ish fused scores.
+	fresh := Memory{ID: "fresh", Category: "decision", CreatedAt: "2026-07-10 00:00:00"} // 5 days
+	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days → floored
+	scores := map[string]float64{"fresh": 0.4, "stale": 0.5}
+
+	got := decayRank([]Memory{stale, fresh}, scores, p, 10, now)
+	if got[0].ID != "fresh" {
+		t.Errorf("decay should rank fresher first, got %v", ids(got))
+	}
+
+	// DecayEnabled false ranks by base score only: stale's higher base (0.5 vs
+	// 0.4) wins. (decayRank sorts by base in both modes — the fused path
+	// hydrates via GetByIDs, which does not preserve order.)
+	off := p
+	off.DecayEnabled = false
+	got = decayRank([]Memory{stale, fresh}, scores, off, 10, now)
+	if got[0].ID != "stale" {
+		t.Errorf("DecayEnabled=false must rank by base score, got %v", ids(got))
+	}
+
+	// Unparseable created_at treated as ancient (never spuriously wins).
+	bad := Memory{ID: "bad", Category: "decision", CreatedAt: "not-a-date"}
+	got = decayRank([]Memory{bad, fresh}, scores, p, 10, now)
+	if got[0].ID != "fresh" {
+		t.Errorf("malformed timestamp must not win; got %v", ids(got))
+	}
+}
+
+func TestApplyDecay_Membership(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams()
-	p.RecencyWeight = 1
-	p.RecencyTau = 30
 
-	// Equal base scores; fresher memory must rank first once recency is on.
-	fresh := Memory{ID: "fresh", CreatedAt: "2026-07-10 00:00:00"} // 5 days
-	stale := Memory{ID: "stale", CreatedAt: "2026-04-16 00:00:00"} // 90 days
-	scores := map[string]float64{"fresh": 0.5, "stale": 0.5}
+	// Base scores put stale just above the cutoff; decay must drop it.
+	mems := []Memory{
+		{ID: "stale", Category: "dependency", CreatedAt: "2026-01-01 00:00:00"}, // 195 days → floored 0.15
+		{ID: "fresh", Category: "dependency", CreatedAt: "2026-07-14 00:00:00"}, // 1 day → ~0.97
+	}
+	scores := map[string]float64{"stale": 0.9, "fresh": 0.5}
 
-	got := applyRecency([]Memory{stale, fresh}, scores, p, now)
-	if got[0].ID != "fresh" {
-		t.Errorf("recency should rank fresher first, got %v", []string{got[0].ID, got[1].ID})
+	// limit 1: without decay the stale memory (higher base) would win.
+	got := decayRank(mems, scores, p, 1, now)
+	if len(got) != 1 || got[0].ID != "fresh" {
+		t.Errorf("decay must change membership (fresh rescues the slot), got %v", ids(got))
 	}
 
-	// Weight 0 is a hard no-op: input order preserved even though stale is first.
-	off := DefaultSearchParams() // RecencyWeight 0
-	got = applyRecency([]Memory{stale, fresh}, scores, off, now)
-	if got[0].ID != "stale" {
-		t.Errorf("w=0 must not reorder; got %v", []string{got[0].ID, got[1].ID})
-	}
-
-	// Unparseable created_at gets no boost — cannot leapfrog a real fresh memory.
-	bad := Memory{ID: "bad", CreatedAt: "not-a-date"}
-	got = applyRecency([]Memory{bad, fresh}, map[string]float64{"bad": 0.5, "fresh": 0.5}, p, now)
-	if got[0].ID != "fresh" {
-		t.Errorf("malformed timestamp must not win; got %v", []string{got[0].ID, got[1].ID})
+	off := p
+	off.DecayEnabled = false
+	got = decayRank(mems, scores, off, 1, now)
+	if len(got) != 1 || got[0].ID != "stale" {
+		t.Errorf("without decay, higher base score must win, got %v", ids(got))
 	}
 }
 
