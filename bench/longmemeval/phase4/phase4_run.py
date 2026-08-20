@@ -225,7 +225,6 @@ def cmd_generate(args):
 # --------------------------------------------------------------------------
 def cmd_judge(args):
     _, get_anscheck_prompt = import_official(args.longmemeval_src)
-    from abstention_prompt import get_abstention_prompt
     if args.api_base_url:
         key = get_key_openai_compat()
     else:
@@ -246,14 +245,9 @@ def cmd_judge(args):
                 continue
             e = meta[qid]
             abstention = qid.endswith("_abs")
-
-            if abstention:
-                prompt = get_abstention_prompt(e["question"], h["hypothesis"])
-            else:
-                prompt = get_anscheck_prompt(
-                    e["question_type"], e["question"], e["answer"], h["hypothesis"],
-                    abstention=abstention)
-
+            prompt = get_anscheck_prompt(
+                e["question_type"], e["question"], e["answer"], h["hypothesis"],
+                abstention=abstention)
             resp = chat(args.provider, args.model, key, prompt, 50,
                         api_base_url=args.api_base_url)
             label = "yes" in resp.lower()
@@ -276,32 +270,15 @@ def _report(judged_path):
     rows = [json.loads(l) for l in open(judged_path) if l.strip()]
     if not rows:
         sys.exit(f"error: no rows in {judged_path}")
-
-    non_abstention = [r for r in rows if not r["abstention"]]
-    abstention = [r for r in rows if r["abstention"]]
-
-    overall_labels = [1 if r["autoeval_label"] else 0 for r in rows]
-    non_abstention_labels = [1 if r["autoeval_label"] else 0 for r in non_abstention]
-    abstention_labels = [1 if r["autoeval_label"] else 0 for r in abstention]
-
-    overall_acc = sum(overall_labels) / len(overall_labels) if overall_labels else 0
-    non_abstention_acc = (sum(non_abstention_labels) / len(non_abstention_labels)
-                         if non_abstention_labels else 0)
-    abstention_acc = (sum(abstention_labels) / len(abstention_labels)
-                      if abstention_labels else 0)
-
+    labels = [1 if r["autoeval_label"] else 0 for r in rows]
     by_type = defaultdict(list)
-    for r in non_abstention:
+    for r in rows:
         by_type[r["question_type"]].append(1 if r["autoeval_label"] else 0)
 
-    print(f"\nQuestions judged : {len(rows)}")
-    print(f"  Non-abstention: {len(non_abstention)}")
-    print(f"  Abstention:     {len(abstention)}")
-    print(f"\nAccuracy (blended 500-question): {overall_acc:.4f}")
-    print(f"Accuracy (non-abstention 470-question): {non_abstention_acc:.4f}")
-    print(f"Accuracy (abstention 30-question): {abstention_acc:.4f}")
-
-    print("\nPer question_type (non-abstention):")
+    overall = sum(labels) / len(labels)
+    print(f"\nQuestions judged : {len(labels)}")
+    print(f"Accuracy (overall): {overall:.4f}")
+    print("\nPer question_type:")
     for t in sorted(by_type):
         v = by_type[t]
         print(f"  {t:28s} {sum(v)/len(v):.4f}  (n={len(v)})")
