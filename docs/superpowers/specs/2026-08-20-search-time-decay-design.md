@@ -69,31 +69,40 @@ clock at query time. To keep the comparison exact:
 This is the enforcement that keeps the two implementations from drifting when
 either side changes in the future.
 
-### 3. Apply decay in ranking, before truncation
+### 3. Apply decay in ranking — reorder-only, never membership-changing
 
-In `fuseAndRank` and `SearchHybridAll`, multiply each candidate's fused RRF
-score by `decayFactor(category, pinned, ageDays)` **before** sort + truncate.
-This makes decay affect both membership (which memories are returned) and
-ordering, matching `GetTopMemories` semantics — a fresh-but-just-below-cutoff
-memory can be rescued, a stale one dropped.
+In `fuseAndRank` and `SearchHybridAll`, truncate to `limit` by base score
+(relevance) first, then reorder the surviving window by `base ×
+decayFactor(category, pinned, ageDays)`. Decay is **ordering-only**: it can
+lift a fresh version above a stale one inside the window, but it never changes
+which memories are returned.
+
+This deviates from the original "before truncation" intent, which was tested
+and found to regress findability. The problem: on the FTS-only path the base
+score is synthesized from position (`1/(RRFK+rank+1)`) and spans only ~1.3×
+across the candidate window, while the decay factor spans ~5.4× for the
+staleness fixture. Multiplying before truncation therefore lets decay override
+relevance — the top-10 becomes "the 10 youngest matching memories", and a
+rank-1 relevant fresh answer is displaced by unrelated younger clutter (3/48
+staleness probes lost their fresh version). Truncate-first keeps fresh-found at
+1.000 while still flipping fresh-wins from 0.083 → 0.938.
 
 Pipeline consequence: `fuseAndRank` currently hydrates (`GetByIDs`) only the
-already-truncated `limit` window. Decay needs each candidate's
-category/pinned/created_at, so hydration must move **before** truncation —
-hydrate all `limit*2` candidates, compute `fused × decay`, sort, then
-truncate. This is a slightly larger read but bounded by the existing `limit*2`
-candidate pool; no schema change.
+already-truncated `limit` window. The decay reorder still needs each
+candidate's category/pinned/created_at, so hydration moves **before** the final
+ranking — hydrate the `limit*2` candidate pool, sort by base, truncate, then
+reorder the window by `fused × decay`. This is a slightly larger read but
+bounded by the existing `limit*2` candidate pool; no schema change.
 
 The FTS-only fallback paths (`SearchHybrid`/`SearchHybridAll` with no query
-vector, and `SearchHybridParams`' FTS-only returns) must apply the same decay
-**before** truncation, not after. Today they truncate-then-`applyRecency`
-(`recencyRerank`); the staleness suite probes exactly this FTS-only path, so a
-decay that only lived in the fused path would leave the suite measuring
-nothing. Replace `recencyRerank` with a decay-aware variant that ranks
-candidates by synthesized base score × decay, then truncates. Note that
-`internal/memory/decisions.go:138`'s comment references `recencyRerank`'s
-"truncate first" invariant — update that comment when the function's semantics
-change (the decisions code itself is unaffected).
+vector, and `SearchHybridParams`' FTS-only returns) must apply the same
+truncate-then-reorder. Today they truncate-then-`applyRecency` (`recencyRerank`)
+— a structure that already truncates first, so the reorder-only change fits
+without regressing findability. Replace `recencyRerank` with `decayRank`, which
+ranks by synthesized base score, truncates, then reorders by `base × decay`.
+Note that `internal/memory/decisions.go:138`'s comment references
+`recencyRerank`'s "truncate first" invariant — update that comment when the
+function's semantics change (the decisions code itself is unaffected).
 
 Age reads `created_at`, never `updated_at` (Upsert's strengthen path bumps the
 latter). Unparseable `created_at` → treated as ancient (existing

@@ -4,7 +4,7 @@
 
 **Goal:** Make `ghost_memory_search` / `ghost_search_all` time-aware by applying `DecayRankingSQL`'s category-aware decay factor to the Go-side fused ranking, so search and the session-start top-memories summary agree.
 
-**Architecture:** A single Go `decayFactor(category, pinned, ageDays)` mirrors the existing SQL constant; a parity test enforces the two can't drift. The decay multiplies each candidate's fused RRF score (or synthesized position score on FTS-only paths) **before** sort + truncation, giving decay membership power (matching `GetTopMemories`). `applyRecency`/`RecencyWeight`/`RecencyTau` are removed; `SearchParams` gains `DecayEnabled` (default true, bench-only toggle).
+**Architecture:** A single Go `decayFactor(category, pinned, ageDays)` mirrors the existing SQL constant; a parity test enforces the two can't drift. Ranking truncates to `limit` by base score (relevance) first, then reorders the surviving window by base × decay when `DecayEnabled` is true — decay reorders but never changes membership, so a relevant answer is never dropped for an unrelated-but-younger one (see the staleness-suite findability finding in the spec). `applyRecency`/`RecencyWeight`/`RecencyTau` are removed; `SearchParams` gains `DecayEnabled` (default true, bench-only toggle).
 
 **Tech Stack:** Go 1.26, SQLite (modernc.org/sqlite, no CGO), existing `internal/memory` + `internal/bench` packages. Tests via `go test ./...`; benchmark harness via `go run ./cmd/ghost bench`.
 
@@ -15,6 +15,7 @@
 - SQLite schema is embedded in `internal/memory/schema.go` — **no schema change in this feature**.
 - `DecayRankingSQL` in `internal/memory/store.go:723` must NOT change (it's the source of truth for `GetTopMemories` + session-start hook). The Go function must mirror it.
 - Decay factor values: pinned → 1.0; preference/convention/fact → 1.0; pattern/architecture → `max(0.3, 1/(1+ageDays/45))`; all other categories → `max(0.15, 1/(1+ageDays/30))`. Age from `created_at` only (never `updated_at`); unparseable → ancient (no boost).
+- **Decay is reorder-only, never membership-changing:** truncate to `limit` by base score first, then reorder the window by base × decay. Rationale (found during implementation): in the FTS-only path the synthesized base `1/(RRFK+rank+1)` spans only ~1.3× over the candidate window while decay spans ~5.4×, so multiplying before truncation lets decay override relevance and drops rank-1 relevant fresh answers in favor of unrelated younger memories (3/48 staleness probes regressed). Truncate-first keeps fresh-found at 1.000.
 - Recency-trap bench fixtures stay `fact` category (never-decay) — do NOT change them; changing them makes the suite fail by design (see spec).
 - Never commit to main directly — feature branch + PR.
 
@@ -206,7 +207,7 @@ git commit -m "test(memory): SQL-vs-Go decay factor parity test (#316)"
 
 ---
 
-### Task 3: Rewire ranking — apply decay before truncation, remove recency prior
+### Task 3: Rewire ranking — decay reorders the window (truncate-first), remove recency prior
 
 **Files:**
 - Modify: `internal/memory/vector.go` — `SearchParams` struct (~line 139), `DefaultSearchParams` (~line 180), `applyRecency` (delete, ~line 243), `fuseAndRank` (~line 287), `SearchHybrid`/`SearchHybridParams` (~line 343), `recencyRerank` (delete, ~line 385), `SearchHybridAll` (~line 462)
@@ -226,11 +227,11 @@ type SearchParams struct {
 	VecWeight   float64 // RRF weight of the vector leg
 	RRFK        int     // RRF smoothing constant (Cormack & Clarke use 60)
 	// DecayEnabled applies the category-aware time-decay factor
-	// (decayFactor — the Go mirror of DecayRankingSQL) to each candidate's
-	// fused score before ranking, giving decay membership power: a
-	// fresh-but-just-below-cutoff memory can be rescued, a stale one dropped.
-	// True by default (production behavior). The bench harness toggles it to
-	// measure decay-on vs decay-off impact.
+	// (decayFactor — the Go mirror of DecayRankingSQL) to reorder the result
+	// window after truncation: decay reorders but never changes membership, so
+	// a more-relevant memory is never dropped in favor of an unrelated younger
+	// one. True by default (production behavior). The bench harness toggles it
+	// to measure decay-on vs decay-off impact.
 	DecayEnabled bool
 	// SupersedeDemote, when true, demotes a memory below its superseder within
 	// the result window when a valid 'supersedes' link between them exists AND
@@ -264,13 +265,14 @@ Update the doc comment above `DefaultSearchParams` that references the recency p
 Add to `internal/memory/vector_test.go` (replacing the now-invalid `TestApplyRecency` at line 689):
 
 ```go
-func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
+func TestApplyDecay_ReordersWindow(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams() // DecayEnabled true
 
-	// Fresh decision must beat stale decision at equal-ish fused scores.
+	// Within the window, decay reorders: fresh decision beats stale decision
+	// at equal-ish fused scores (decay-on multiplies the window by decay).
 	fresh := Memory{ID: "fresh", Category: "decision", CreatedAt: "2026-07-10 00:00:00"} // 5 days
-	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days → floored
+	stale := Memory{ID: "stale", Category: "decision", CreatedAt: "2026-04-16 00:00:00"} // 90 days
 	scores := map[string]float64{"fresh": 0.4, "stale": 0.5}
 
 	got := decayRank([]Memory{stale, fresh}, scores, p, 10, now)
@@ -296,23 +298,29 @@ func TestApplyDecay_RescuesFreshBelowCutoff(t *testing.T) {
 	}
 }
 
-func TestApplyDecay_Membership(t *testing.T) {
+// TestApplyDecay_PreservesMembership is the regression guard for the
+// findability finding: truncation happens by base score ALONE, so decay
+// reorders within the window but can never drop a higher-base (more relevant)
+// memory below the cutoff. This is what keeps TestStalenessReport green.
+func TestApplyDecay_PreservesMembership(t *testing.T) {
 	now := timeMustParse("2026-07-15 00:00:00")
 	p := DefaultSearchParams()
 
-	// Base scores put stale just above the cutoff; decay must drop it.
+	// stale has the higher base score (0.9 vs 0.5) but is heavily decayed;
+	// fresh is barely decayed but lower base. Decay must NOT let fresh displace
+	// stale from a limit-1 window — relevance (base) owns membership.
 	mems := []Memory{
 		{ID: "stale", Category: "dependency", CreatedAt: "2026-01-01 00:00:00"}, // 195 days → floored 0.15
 		{ID: "fresh", Category: "dependency", CreatedAt: "2026-07-14 00:00:00"}, // 1 day → ~0.97
 	}
 	scores := map[string]float64{"stale": 0.9, "fresh": 0.5}
 
-	// limit 1: without decay the stale memory (higher base) would win.
 	got := decayRank(mems, scores, p, 1, now)
-	if len(got) != 1 || got[0].ID != "fresh" {
-		t.Errorf("decay must change membership (fresh rescues the slot), got %v", ids(got))
+	if len(got) != 1 || got[0].ID != "stale" {
+		t.Errorf("decay must NOT change membership (base 0.9 > 0.5 owns the slot), got %v", ids(got))
 	}
 
+	// Same result with decay off (trivially base order).
 	off := p
 	off.DecayEnabled = false
 	got = decayRank(mems, scores, off, 1, now)
@@ -334,16 +342,17 @@ Delete the entire `applyRecency` function (`vector.go:231-272`).
 Replace `recencyRerank` (`vector.go:377-390`) with a decay-aware ranker:
 
 ```go
-// decayRank ranks results by base score × decayFactor. base is the fused
-// score when scores is non-nil; otherwise it is synthesized from position
-// (the FTS-only paths), base = 1/(RRFK+rank+1). Decay applies BEFORE
-// truncation so it can change which memories come back (matching
-// GetTopMemories). With DecayEnabled false the results are still sorted by
-// base score then truncated — the fused path hydrates via GetByIDs, which
-// does NOT preserve order, so an explicit sort is required in both modes.
-// Age reads created_at — never updated_at, which Upsert's strengthen path
-// bumps. An unparseable created_at is treated as ancient so a malformed
-// timestamp can never spuriously win.
+// decayRank truncates results to limit by base score, then (when enabled)
+// reorders the surviving window by base score × decayFactor. base is the fused
+// score when scores is non-nil; otherwise it is synthesized from position (the
+// FTS-only paths), base = 1/(RRFK+rank+1). Membership is owned by base score
+// alone — decay reorders but never drops a more-relevant memory, which is what
+// keeps findability intact (a rank-1 relevant fresh answer is never displaced
+// by unrelated younger memories). The sort by base happens in both modes — the
+// fused path hydrates via GetByIDs, which does NOT preserve order. Age reads
+// created_at — never updated_at, which Upsert's strengthen path bumps. An
+// unparseable created_at is treated as ancient so a malformed timestamp can
+// never spuriously win.
 func decayRank(results []Memory, scores map[string]float64, p SearchParams, limit int, now time.Time) []Memory {
 	scored := make([]struct {
 		m    Memory
@@ -359,23 +368,30 @@ func decayRank(results []Memory, scores map[string]float64, p SearchParams, limi
 			base float64
 		}{m, base}
 	}
-	// Rank by base (× decay when enabled), then truncate. Sorting in the
-	// no-decay mode preserves base-score order (fused score in the fused path,
-	// FTS rank in the FTS-only path).
+
+	// Truncate by base score first: relevance owns membership.
 	sort.SliceStable(scored, func(i, j int) bool {
-		fi, fj := scored[i].base, scored[j].base
-		if p.DecayEnabled {
-			fi *= decayFactor(scored[i].m.Category, scored[i].m.Pinned, ageDays(scored[i].m.CreatedAt, now))
-			fj *= decayFactor(scored[j].m.Category, scored[j].m.Pinned, ageDays(scored[j].m.CreatedAt, now))
-		}
-		if fi != fj {
-			return fi > fj
+		if scored[i].base != scored[j].base {
+			return scored[i].base > scored[j].base
 		}
 		return scored[i].m.ID < scored[j].m.ID
 	})
 	if len(scored) > limit {
 		scored = scored[:limit]
 	}
+
+	// Reorder the window by base × decay (ordering only, never membership).
+	if p.DecayEnabled {
+		sort.SliceStable(scored, func(i, j int) bool {
+			fi := scored[i].base * decayFactor(scored[i].m.Category, scored[i].m.Pinned, ageDays(scored[i].m.CreatedAt, now))
+			fj := scored[j].base * decayFactor(scored[j].m.Category, scored[j].m.Pinned, ageDays(scored[j].m.CreatedAt, now))
+			if fi != fj {
+				return fi > fj
+			}
+			return scored[i].m.ID < scored[j].m.ID
+		})
+	}
+
 	out := make([]Memory, len(scored))
 	for i, s := range scored {
 		out[i] = s.m
@@ -394,7 +410,7 @@ func ageDays(createdAt string, now time.Time) float64 {
 }
 ```
 
-Rewrite `fuseAndRank` (`vector.go:287-341`) so decay happens before truncation:
+Rewrite `fuseAndRank` (`vector.go:287-341`) to hydrate the full candidate pool and hand truncation + decay reordering to `decayRank`:
 
 ```go
 func (s *Store) fuseAndRank(ctx context.Context, ftsResults []Memory, vecResults []ScoredMemory, limit int, p SearchParams) ([]Memory, error) {
@@ -414,10 +430,9 @@ func (s *Store) fuseAndRank(ctx context.Context, ftsResults []Memory, vecResults
 		ranked = append(ranked, id)
 	}
 
-	// Hydrate the FULL candidate pool before ranking — decay needs
-	// category/pinned/created_at to decide membership, and a fresh memory just
-	// below the fused-score cutoff must be rescurable. Truncation happens
-	// inside decayRank.
+	// Hydrate the full candidate pool before ranking — decayRank needs
+	// category/pinned/created_at to reorder the window, and hydration via
+	// GetByIDs does not preserve order, so the final sort lives there too.
 	memories, err := s.GetByIDs(ctx, ranked)
 	if err != nil {
 		return nil, err
@@ -473,9 +488,9 @@ Expected: PASS. (`internal/supersede/supersede_test.go:121` and mcpserver tests 
 git add internal/memory/vector.go internal/memory/vector_test.go internal/memory/decisions.go
 git commit -m "feat(memory): apply category-aware time-decay to search ranking (#316)
 
-SearchHybrid/SearchHybridAll now multiply each candidate's fused score by
-decayFactor before truncation (membership-changing, matching GetTopMemories).
-Replaces the RecencyWeight/RecencyTau prior and recencyRerank with an
+SearchHybrid/SearchHybridAll truncate to limit by base score, then reorder the
+window by decayFactor (ordering-only, so decay never drops a more-relevant
+memory). Replaces the RecencyWeight/RecencyTau prior and recencyRerank with an
 always-on DecayEnabled default; bench harness can toggle it."
 ```
 
@@ -701,7 +716,7 @@ git commit -m "bench: replace RecencyWeight sweep proofs with decay-aware tests 
 
 The current section documents `RecencyWeight` as a shipped-but-default-off global prior with the recency-trap verdict. Replace the mechanism description with the new category-aware decay:
 
-- The mechanism is now `SearchParams.DecayEnabled` (default true): each candidate's fused score is multiplied by `decayFactor(category, pinned, ageDays)` — pinned/preference/convention/fact never decay; pattern/architecture τ=45 floor 0.3; else τ=30 floor 0.15 — applied before truncation so it affects membership.
+- The mechanism is now `SearchParams.DecayEnabled` (default true): results are truncated to `limit` by base score, then the window is reordered by `decayFactor(category, pinned, ageDays)` — pinned/preference/convention/fact never decay; pattern/architecture τ=45 floor 0.3; else τ=30 floor 0.15. Decay is ordering-only: it never changes membership, which is what keeps findability intact (see the spec's reorder-only rationale).
 - Keep the recency-trap rationale verbatim (it's why the old blanket age-only prior was rejected and why decay is category-aware rather than age-only) but update the stale `RecencyWeight` formula references to the decay formula.
 - Update the "Why it stays off as a global default" heading to reflect that decay IS on now, and that category-awareness (never-decay categories) is what resolves the staleness/trap cliff the experiment exposed.
 
