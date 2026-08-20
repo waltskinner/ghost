@@ -701,6 +701,151 @@ func TestStoreRestoreSnapshot(t *testing.T) {
 	}
 }
 
+// TestStoreReplaceNonManual_PreservesResolved guards issue #318: a memory marked
+// resolved by ghost resolve must survive a reflect --apply round trip untouched,
+// not be deleted and not be resurrected as a fresh unresolved duplicate.
+func TestStoreReplaceNonManual_PreservesResolved(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	resolvedID, err := s.Create(ctx, testProject, Memory{
+		Category: "gotcha", Content: "changelog evidence, already resolved", Source: "reflection", Importance: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("create resolved candidate: %v", err)
+	}
+	if _, err := s.SetResolved(ctx, []string{resolvedID}); err != nil {
+		t.Fatalf("SetResolved: %v", err)
+	}
+
+	if _, err := s.Create(ctx, testProject, Memory{
+		Category: "fact", Content: "old reflection fact", Source: "reflection", Importance: 0.5,
+	}); err != nil {
+		t.Fatalf("create unresolved: %v", err)
+	}
+
+	replacement := []Memory{
+		{Category: "fact", Content: "new consolidated fact", Importance: 0.6, Tags: []string{}},
+	}
+	if err := s.ReplaceNonManual(ctx, testProject, replacement, ""); err != nil {
+		t.Fatalf("ReplaceNonManual: %v", err)
+	}
+
+	all, err := s.GetAll(ctx, testProject, 100)
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	var foundResolved, foundReplacement, foundOld bool
+	for _, m := range all {
+		if m.ID == resolvedID && m.ResolvedAt != nil {
+			foundResolved = true
+		}
+		if m.Content == "new consolidated fact" {
+			foundReplacement = true
+		}
+		if m.Content == "old reflection fact" {
+			foundOld = true
+		}
+	}
+	if !foundResolved {
+		t.Fatal("resolved memory was dropped by ReplaceNonManual")
+	}
+	if !foundReplacement {
+		t.Error("replacement memory should be present")
+	}
+	if foundOld {
+		t.Error("old unresolved reflection fact should have been replaced")
+	}
+}
+
+// TestStoreRestoreSnapshot_PreservesResolved guards the restore leg of #318:
+// --restore must not delete a resolved memory that reflection never touched.
+func TestStoreRestoreSnapshot_PreservesResolved(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	resolvedID, err := s.Create(ctx, testProject, Memory{
+		Category: "gotcha", Content: "resolved evidence stays resolved", Source: "reflection", Importance: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("create resolved: %v", err)
+	}
+	if _, err := s.SetResolved(ctx, []string{resolvedID}); err != nil {
+		t.Fatalf("SetResolved: %v", err)
+	}
+
+	if _, err := s.Create(ctx, testProject, Memory{
+		Category: "fact", Content: "old reflection fact to be snapshotted", Source: "reflection", Importance: 0.5,
+	}); err != nil {
+		t.Fatalf("create old: %v", err)
+	}
+
+	replacement := []Memory{
+		{Category: "fact", Content: "new consolidated fact", Importance: 0.6, Tags: []string{}},
+	}
+	if err := s.ReplaceNonManual(ctx, testProject, replacement, ""); err != nil {
+		t.Fatalf("ReplaceNonManual: %v", err)
+	}
+	if _, err := s.RestoreSnapshot(ctx, testProject); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+
+	all, err := s.GetAll(ctx, testProject, 100)
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	var foundResolved bool
+	for _, m := range all {
+		if m.ID == resolvedID && m.ResolvedAt != nil {
+			foundResolved = true
+		}
+	}
+	if !foundResolved {
+		t.Fatal("resolved memory was dropped by RestoreSnapshot")
+	}
+}
+
+// TestStoreGetAll_ReturnsResolvedAt verifies GetAll exposes resolved_at, the
+// field reflect relies on to exclude resolved memories from consolidation input.
+func TestStoreGetAll_ReturnsResolvedAt(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	plainID, err := s.Create(ctx, testProject, Memory{
+		Category: "fact", Content: "unresolved fact", Source: "reflection", Importance: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	resolvedID, err := s.Create(ctx, testProject, Memory{
+		Category: "gotcha", Content: "resolved evidence", Source: "reflection", Importance: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("create resolved: %v", err)
+	}
+	if _, err := s.SetResolved(ctx, []string{resolvedID}); err != nil {
+		t.Fatalf("SetResolved: %v", err)
+	}
+
+	all, err := s.GetAll(ctx, testProject, 100)
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	byID := map[string]*Memory{}
+	for i := range all {
+		byID[all[i].ID] = &all[i]
+	}
+	if byID[plainID].ResolvedAt != nil {
+		t.Error("unresolved memory should have nil ResolvedAt")
+	}
+	if byID[resolvedID].ResolvedAt == nil {
+		t.Error("resolved memory should have non-nil ResolvedAt")
+	}
+}
+
 func TestStoreSearchFTS(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

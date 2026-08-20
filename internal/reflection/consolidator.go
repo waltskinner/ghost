@@ -14,6 +14,11 @@ type Consolidator interface {
 	Name() string
 	Available(ctx context.Context) bool
 	Consolidate(ctx context.Context, input ReflectionInput) (ReflectionResult, error)
+	// Mechanical reports whether this tier is the deterministic fallback
+	// (Jaccard dedup) rather than an LLM. Mechanical tiers are exempt from the
+	// quality gate; LLM tiers are not — a truncated/hallucinated LLM result
+	// must never be accepted merely because it happens to be the last tier.
+	Mechanical() bool
 }
 
 // TieredConsolidator tries consolidators in priority order (highest tier first),
@@ -41,6 +46,10 @@ func (t *TieredConsolidator) Name() string {
 	return "tiered:none"
 }
 
+// Mechanical is false: a tiered consolidator may contain LLM tiers, so its
+// output is never exempt from the quality gate.
+func (t *TieredConsolidator) Mechanical() bool { return false }
+
 func (t *TieredConsolidator) Available(ctx context.Context) bool {
 	for _, tier := range t.tiers {
 		if tier.Available(ctx) {
@@ -67,9 +76,13 @@ func (t *TieredConsolidator) Consolidate(ctx context.Context, input ReflectionIn
 
 		// Quality gate: if there were enough input memories and the tier returned
 		// less than 30% of them, treat the result as garbage and fall through.
-		// The last tier (SQLite) is always accepted — it's the mechanical fallback.
+		// The mechanical fallback (SQLite Jaccard dedup) is always accepted — it
+		// is deterministic and cannot truncate or hallucinate. LLM tiers are
+		// never exempt by position: with --require-llm the sqlite tier is omitted
+		// from the list, so the last tier may be a real LLM whose garbage output
+		// must still be rejected.
 		inputCount := len(input.ExistingMemories)
-		if inputCount >= 6 && len(result.Memories) < inputCount*3/10 && i < len(t.tiers)-1 {
+		if inputCount >= 6 && len(result.Memories) < inputCount*3/10 && !tier.Mechanical() {
 			t.logger.Warn("consolidator returned too few memories, trying next tier",
 				"tier", tier.Name(),
 				"input", inputCount,

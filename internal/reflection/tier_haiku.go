@@ -35,6 +35,9 @@ func NewNamedConsolidator(client reflector, name string) *HaikuConsolidator {
 
 func (h *HaikuConsolidator) Name() string { return h.name }
 
+// Mechanical is false: this is an LLM tier, never exempt from the quality gate.
+func (h *HaikuConsolidator) Mechanical() bool { return false }
+
 func (h *HaikuConsolidator) Available(_ context.Context) bool {
 	return h.client != nil
 }
