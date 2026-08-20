@@ -31,7 +31,10 @@ func TestParseOpenCodeOutput_ConcatenatesTextEvents(t *testing.T) {
 {"type":"text","timestamp":3,"part":{"id":"b","type":"text","text":"[]}"}}
 {"type":"step_finish","timestamp":4,"part":{"id":"c","type":"step-finish","reason":"stop"}}
 `
-	got := parseOpenCodeOutput(raw)
+	got, err := parseOpenCodeOutput(raw)
+	if err != nil {
+		t.Fatalf("parseOpenCodeOutput: %v", err)
+	}
 	if got != `{"memories":[]}` {
 		t.Errorf("got %q, want concatenated text events", got)
 	}
@@ -42,8 +45,19 @@ func TestParseOpenCodeOutput_IgnoresNonText(t *testing.T) {
 {"type":"reasoning","part":{"type":"reasoning","text":"thinking aloud"}}
 {"type":"text","part":{"id":"a","type":"text","text":"OK"}}
 `
-	if got := parseOpenCodeOutput(raw); got != "OK" {
+	got, err := parseOpenCodeOutput(raw)
+	if err != nil {
+		t.Fatalf("parseOpenCodeOutput: %v", err)
+	}
+	if got != "OK" {
 		t.Errorf("got %q, want only text events", got)
+	}
+}
+
+func TestParseOpenCodeOutput_MalformedLineErrors(t *testing.T) {
+	raw := "not json at all\n"
+	if _, err := parseOpenCodeOutput(raw); err == nil {
+		t.Fatal("expected error for malformed JSON line")
 	}
 }
 

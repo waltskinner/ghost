@@ -436,6 +436,57 @@ func TestSQLiteConsolidator_NumericDifferenceBlocksMerge(t *testing.T) {
 	}
 }
 
+// TestSQLiteConsolidator_SingleDigitNumericDifferenceBlocksMerge guards the
+// single-character token case: "port 8" vs "port 9" must differ even though the
+// numeric tokens are length one and would be dropped by the len>1 filter alone.
+func TestSQLiteConsolidator_SingleDigitNumericDifferenceBlocksMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "preprod network magic is 1", Importance: 0.7},
+			{Category: "fact", Content: "preprod network magic is 2", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected single-digit numeric difference to block merge, got %d memories", len(result.Memories))
+	}
+}
+
+// TestSQLiteConsolidator_PartialContainmentDoesNotMerge guards the containment
+// over-merge: two distinct facts that share a common word ("deploy staging" vs
+// "deploy production") have containment 0.5 and must NOT merge. Only full
+// subsumption (containment 1.0) triggers the containment merge.
+func TestSQLiteConsolidator_PartialContainmentDoesNotMerge(t *testing.T) {
+	sc := NewSQLiteConsolidator()
+	input := ReflectionInput{
+		ExistingMemories: []memory.Memory{
+			{Category: "fact", Content: "deploy to staging", Importance: 0.7},
+			{Category: "fact", Content: "deploy to production", Importance: 0.7},
+		},
+	}
+	result, err := sc.Consolidate(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Memories) != 2 {
+		t.Fatalf("expected partial containment to NOT merge, got %d memories", len(result.Memories))
+	}
+}
+
+func TestTokenize_RetainsSingleDigitNumericTokens(t *testing.T) {
+	tokens := tokenize("port 8 and port 9")
+	if !tokens["8"] || !tokens["9"] {
+		t.Errorf("single-digit numeric tokens should be retained, got %v", tokens)
+	}
+	if tokens["a"] {
+		t.Error("single-char letters should still be dropped")
+	}
+}
+
 func TestTokenize_ExcludesStopwords(t *testing.T) {
 	tokens := tokenize("ghost uses sqlite for the storage with fts5")
 	if tokens["the"] || tokens["for"] || tokens["with"] {

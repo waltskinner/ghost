@@ -340,7 +340,7 @@ func spawnReflectIfConfigured(cwd string) {
 	}
 	defer logFile.Close() //nolint:errcheck
 
-	cmd := exec.Command(exe, "reflect", projectName, "--apply")
+	cmd := exec.Command(exe, "reflect", projectName, "--apply", "--require-llm")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	detachProcess(cmd)

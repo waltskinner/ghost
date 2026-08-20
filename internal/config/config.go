@@ -140,7 +140,12 @@ func Load() (*Config, error) {
 	// koanf's _ → . transformer would map e.g. GHOST_OBSIDIAN_VAULT_DIR
 	// to obsidian.vault.dir instead of obsidian.vault_dir.
 	envOverrides := map[string]string{
-		"GHOST_OBSIDIAN_VAULT_DIR": "obsidian.vault_dir",
+		"GHOST_OBSIDIAN_VAULT_DIR":        "obsidian.vault_dir",
+		"GHOST_CLI_CLAUDE_BINARY":         "cli.claude_binary",
+		"GHOST_CLI_OPENCODE_BINARY":       "cli.opencode_binary",
+		"GHOST_REFLECTION_AUTO_REFLECT":   "reflection.auto_reflect",
+		"GHOST_REFLECTION_AUTO_RESOLVE":   "reflection.auto_resolve",
+		"GHOST_REFLECTION_AUTO_SUPERSEDE": "reflection.auto_supersede",
 	}
 	for envKey, koanfKey := range envOverrides {
 		if val := os.Getenv(envKey); val != "" {

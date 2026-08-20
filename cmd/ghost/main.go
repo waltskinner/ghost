@@ -266,7 +266,7 @@ func resolveProjectOrExit(ctx context.Context, store *memory.Store, projectName 
 // Use --restore to undo the last consolidation from snapshot.
 func runReflect() {
 	var projectName, tierValue string
-	var apply, restore bool
+	var apply, restore, requireLLM bool
 	tierValue = "auto"
 	for i := 2; i < len(os.Args); i++ {
 		switch {
@@ -279,6 +279,8 @@ func runReflect() {
 			apply = true
 		case os.Args[i] == "--restore":
 			restore = true
+		case os.Args[i] == "--require-llm":
+			requireLLM = true
 		case !strings.HasPrefix(os.Args[i], "-"):
 			projectName = os.Args[i]
 		}
@@ -289,7 +291,8 @@ func runReflect() {
 Flags:
   --tier string   Consolidation tier: auto, haiku, cli, opencode, sqlite (default "auto")
   --apply         Save results (default is dry-run/preview only)
-  --restore       Undo the last consolidation from snapshot`)
+  --restore       Undo the last consolidation from snapshot
+  --require-llm   Fail instead of falling back to the Jaccard-only sqlite tier`)
 		os.Exit(1)
 	}
 
@@ -340,6 +343,10 @@ Flags:
 		}
 		consolidator = reflection.NewNamedConsolidator(ai.NewOpenCodeClientWithBinary(binary), "opencode")
 	case "sqlite":
+		if requireLLM {
+			fmt.Fprintln(os.Stderr, "error: --require-llm conflicts with --tier sqlite")
+			os.Exit(1)
+		}
 		consolidator = reflection.NewSQLiteConsolidator()
 	default: // "auto"
 		var tiers []reflection.Consolidator
@@ -350,7 +357,16 @@ Flags:
 		if cli := ai.NewCLIProviderWithBinaries(cfg.CLI.ClaudeBinary, cfg.CLI.OpenCodeBinary); cli.Available() {
 			tiers = append(tiers, reflection.NewNamedConsolidator(cli, cli.Name()))
 		}
-		tiers = append(tiers, reflection.NewSQLiteConsolidator())
+		// --require-llm is the autonomous-reflect guard: it must never silently
+		// degrade to the Jaccard-only sqlite tier (which would rewrite every
+		// non-manual memory with no consolidation quality). A stale/exhausted
+		// ANTHROPIC_API_KEY is a false positive for "has an LLM", so the cheap
+		// stop-hook pre-check can't be trusted; this flag is the real guard at
+		// the write site — no LLM tier available (or all fail) => exit non-zero
+		// without touching the DB.
+		if !requireLLM {
+			tiers = append(tiers, reflection.NewSQLiteConsolidator())
+		}
 		consolidator = reflection.NewTieredConsolidator(tiers, logger)
 	}
 
@@ -478,7 +494,7 @@ Flags:
 	}
 
 	var existingNonManual int
-	for _, m := range existingMemories {
+	for _, m := range live {
 		if m.Source != "manual" {
 			existingNonManual++
 		}

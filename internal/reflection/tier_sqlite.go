@@ -55,8 +55,12 @@ func (s *SQLiteConsolidator) Consolidate(_ context.Context, input ReflectionInpu
 			}
 
 			sim := jaccard(items[i].tokens, items[j].tokens)
-			if c := containment(items[i].tokens, items[j].tokens); c > sim {
-				sim = c
+			// Containment only fires on full subsumption (the smaller token set
+			// entirely inside the larger). A lower bar would merge partial
+			// overlaps ("deploy staging" vs "deploy production") that are
+			// distinct facts; Jaccard already handles same-length restatements.
+			if c := containment(items[i].tokens, items[j].tokens); c == 1.0 {
+				sim = 1.0
 			}
 			if sim >= 0.5 && !numericConflict(items[i].tokens, items[j].tokens) {
 				absorbed[j] = true
@@ -105,13 +109,20 @@ var stopwords = map[string]bool{
 	"this": true, "to": true, "with": true,
 }
 
-// tokenize splits text into a set of lowercase word tokens (length > 1),
-// excluding stopwords.
+// tokenize splits text into a set of lowercase word tokens, excluding
+// stopwords. Word tokens shorter than two characters are dropped — except
+// purely-numeric tokens, which are retained at length one ("port 8" vs "port 9"
+// must differ), since single-digit numbers are high-signal facts and the
+// numericConflict guard depends on seeing them.
 func tokenize(s string) map[string]bool {
 	tokens := make(map[string]bool)
 	for _, word := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
+		if isNumericToken(word) {
+			tokens[word] = true
+			continue
+		}
 		if len(word) > 1 && !stopwords[word] {
 			tokens[word] = true
 		}

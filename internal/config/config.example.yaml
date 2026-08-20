@@ -49,6 +49,7 @@
 # --- Memory Consolidation ---
 # ghost reflect's tier is chosen via the --tier CLI flag, not config.
 # reflection:
+#   auto_reflect: false               # run ghost reflect --apply automatically on session stop
 #   auto_resolve: false               # run ghost resolve automatically after reflect
 
 # --- Obsidian Vault Mirror ---
