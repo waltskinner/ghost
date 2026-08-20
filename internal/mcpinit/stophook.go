@@ -55,11 +55,12 @@ const stopBlockMessage = `{"decision":"block","reason":"This session used tools 
 // It blocks the stop once — via {"decision":"block"} on stdout — when the
 // session used tools but never saved anything to Ghost. Every failure path
 // returns silently, allowing the stop: the hook must never trap a session.
-// The one exception to "no DB/LLM work on this path" is spawnResolveIfConfigured
-// (and, following the identical exception pattern, spawnSupersedeIfConfigured),
-// which — best-effort, opt-in only — does a small synchronous read-only lookup
-// (config + a project-ID query) before forking a detached `ghost resolve --apply`
-// (respectively `ghost supersede --apply`) and returning immediately without
+// The one exception to "no DB/LLM work on this path" is the three spawn
+// helpers — spawnResolveIfConfigured, spawnSupersedeIfConfigured, and
+// spawnReflectIfConfigured — which, best-effort, opt-in only, do a small
+// synchronous read-only lookup (config + a project-ID query) before forking a
+// detached `ghost resolve --apply` / `ghost supersede --apply` /
+// `ghost reflect --apply --require-llm` and returning immediately without
 // waiting on it; no LLM call and no write ever happens inline here, only in the
 // detached child.
 func HandleStopHook(stdin io.Reader, stdout io.Writer) {
