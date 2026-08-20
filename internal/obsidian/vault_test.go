@@ -66,7 +66,7 @@ func TestPrune(t *testing.T) {
 	mustWrite(t, filepath.Join(sub, "stale-dead0000.md"), ghostNote)
 	mustWrite(t, filepath.Join(sub, "user-note.md"), "no frontmatter")
 
-	if err := prune(root, []string{"proj"}, map[string]string{}); err != nil {
+	if err := prune(root, []string{"proj"}, map[string]string{}, nil); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(sub, "stale-dead0000.md")); !os.IsNotExist(err) {
@@ -80,7 +80,7 @@ func TestPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustWrite(t, filepath.Join(sub, "stale2-beef0000.md"), ghostNote)
-	if err := prune(root, []string{"proj"}, map[string]string{}); err == nil {
+	if err := prune(root, []string{"proj"}, map[string]string{}, nil); err == nil {
 		t.Fatal("prune without marker must error")
 	}
 }
@@ -106,7 +106,7 @@ func TestPruneGuards(t *testing.T) {
 	renamed := "---\nghost_id: cafe0000\ntype: memory\n---\nbody\n"
 	mustWrite(t, filepath.Join(sub, "old-slug-cafe0000.md"), renamed)
 
-	if err := prune(root, []string{"proj"}, map[string]string{"cafe0000": "kept-cafe0000.md"}); err != nil {
+	if err := prune(root, []string{"proj"}, map[string]string{"cafe0000": "kept-cafe0000.md"}, nil); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(sub, "kept-cafe0000.md")); err != nil {
@@ -134,14 +134,14 @@ func TestPruneRefusesEscapingSubtree(t *testing.T) {
 	victim := filepath.Join(escape, "victim-dead0000.md")
 	mustWrite(t, victim, "---\nghost_id: dead0000\ntype: memory\n---\nbody\n")
 
-	if err := prune(root, []string{"../escape"}, map[string]string{}); err == nil {
+	if err := prune(root, []string{"../escape"}, map[string]string{}, nil); err == nil {
 		t.Fatal("prune with escaping subtree must error")
 	}
 	if _, err := os.Stat(victim); err != nil {
 		t.Fatal("file outside the vault root must survive an escaping-subtree prune attempt")
 	}
 	// Absolute paths must be refused too.
-	if err := prune(root, []string{escape}, map[string]string{}); err == nil {
+	if err := prune(root, []string{escape}, map[string]string{}, nil); err == nil {
 		t.Fatal("prune with absolute subtree must error")
 	}
 	if _, err := os.Stat(victim); err != nil {
