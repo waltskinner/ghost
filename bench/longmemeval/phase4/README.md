@@ -55,6 +55,32 @@ checkout with `--longmemeval-src` or the `$LONGMEMEVAL_SRC` env var.
 
 The driver never prints a key and never dumps the request headers.
 
+## OpenAI-compatible providers (DeepSeek, OpenCode, etc.)
+
+Use `--provider openai --api-base-url <URL>` to point at any
+OpenAI-compatible API. The driver sends the same `Authorization: Bearer`
+header and chat-completions body; only the base URL changes.
+
+Examples:
+
+```bash
+# DeepSeek V4 Pro via their API
+python phase4_run.py generate --provider openai --model deepseek-v4-pro \
+    --api-base-url https://api.deepseek.com \
+    --dataset merged.json --out hyp.jsonl
+python phase4_run.py judge --provider openai --model deepseek-v4-pro \
+    --api-base-url https://api.deepseek.com \
+    --dataset merged.json --hyp hyp.jsonl
+
+# OpenCode Go (Zen)
+python phase4_run.py generate --provider openai --model deepseek-v4-pro \
+    --api-base-url https://opencode.ai/zen/go \
+    --dataset merged.json --out hyp.jsonl
+```
+
+DeepSeek models put short answers in `reasoning_content` when `max_tokens`
+is tight — the driver falls back to `reasoning_content` automatically.
+
 ## Fidelity — matches the official harness
 
 - Generation: single user message, `temperature=0`, `max_tokens=500` (non-CoT),
