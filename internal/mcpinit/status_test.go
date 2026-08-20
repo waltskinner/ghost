@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wcatz/ghost/internal/config"
 	"github.com/wcatz/ghost/internal/embedding"
 	"github.com/wcatz/ghost/internal/memory"
 )
@@ -159,19 +160,22 @@ func writeStubGhost(t *testing.T) string {
 	return binDir
 }
 
-// writeGhostConfigFile writes a ghost config.yaml into the isolated config dir
-// (os.UserConfigDir under the test's HOME) and returns its path.
+// writeGhostConfigFile writes a ghost config.yaml to the exact path
+// config.ConfigFilePath resolves (which honors XDG_CONFIG_HOME via
+// userConfigDir), so the file is at the location the code under test reads.
+// Using os.UserConfigDir here would diverge on macOS, where it ignores
+// XDG_CONFIG_HOME and returns ~/Library/Application Support, making
+// reportConfigFile report "no config file" for a file that exists.
 func writeGhostConfigFile(t *testing.T, content string) string {
 	t.Helper()
-	configDir, err := os.UserConfigDir()
+	path, err := config.ConfigFilePath()
 	if err != nil {
-		t.Fatalf("user config dir: %v", err)
+		t.Fatalf("config file path: %v", err)
 	}
-	dir := filepath.Join(configDir, "ghost")
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir ghost config dir: %v", err)
 	}
-	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write ghost config: %v", err)
 	}
