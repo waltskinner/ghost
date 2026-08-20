@@ -113,34 +113,50 @@ The pipeline ([`bench/longmemeval/phase4/`](../bench/longmemeval/phase4/)) is fo
 go run ./bench/longmemeval -data longmemeval_s_cleaned.json \
     -condition hybrid -ollama http://localhost:11434 \
     -embed-cache ~/.cache/ghost-bench/embed-cache.jsonl \
+    --include-abstention \
     -retrieval-out ranked.jsonl
 
 # 2. Merge retrieval into dataset
 python bench/longmemeval/phase4/merge_retrieval.py \
     --dataset longmemeval_s_cleaned.json --retrieval ranked.jsonl --out merged.json
 
-# 3. Generate hypotheses (DeepSeek v4 Pro shown; swap provider/model for other runs)
+# 3. Generate hypotheses (DeepSeek v4 Pro via OpenCode Go shown; swap provider/model for other runs)
+export OPENCODE_API_KEY="your-key"
 python bench/longmemeval/phase4/phase4_run.py generate \
-    --provider openai --model deepseek-v4-pro --api-base-url https://api.deepseek.com/v1 \
+    --provider openai --model deepseek-v4-pro \
+    --api-base-url https://opencode.ai/zen/go \
+    --longmemeval-src .cache/LongMemEval/src \
     --dataset merged.json --out hyp.jsonl
 
 # 4. Judge + report
 python bench/longmemeval/phase4/phase4_run.py judge \
-    --provider openai --model deepseek-v4-pro --api-base-url https://api.deepseek.com/v1 \
+    --provider openai --model deepseek-v4-pro \
+    --api-base-url https://opencode.ai/zen/go \
+    --longmemeval-src .cache/LongMemEval/src \
     --dataset merged.json --hyp hyp.jsonl
 ```
 
 See the [phase4 README](../bench/longmemeval/phase4/README.md) for full setup (LongMemEval checkout, API keys, cost estimates).
 
-Results (2026-08-18, DeepSeek v4 Pro as both generator and judge, 470 questions, `topk_context=5`, per-question logs committed):
+### Supported providers
+
+| Provider | Endpoint | Notes |
+|----------|----------|-------|
+| `openai` (default) | `api.openai.com` | Leaderboard-comparable with gpt-4o |
+| `openai` + `--api-base-url` | Any OpenAI-compatible | **OpenCode Go** (`https://opencode.ai/zen/go`), DeepSeek direct, etc. |
+| `anthropic` | `api.anthropic.com` | Internal check, not leaderboard-comparable |
+
+OpenCode Go ($10/mo) provides DeepSeek V4 Pro at ~$0.66-1.32/M input tokens (peak/off-peak), fitting the full 500-question benchmark within the $60/mo usage limit. The `--api-base-url` flag routes requests through any OpenAI-compatible endpoint; a `User-Agent` header is included for Cloudflare compatibility, and `GoUsageLimitError` responses auto-sleep until the rate limit resets.
+
+Results (2026-08-20, DeepSeek v4 Pro as both generator and judge, **500 questions** including 30 abstention, `topk_context=5`):
 
 ```text
-condition   accuracy
-hybrid      96.8% (455/470)
-fts-only    83.6% (393/470)
+condition   blended(500)  non-abstention(470)  abstention(30)
+hybrid      96.2%         96.8%                86.7%
+fts-only    83.4%         83.6%                80.0%
 ```
 
-Per-category breakdown:
+Per-category breakdown (non-abstention):
 
 | Question type | Hybrid | FTS-only | Delta |
 |---|---|---|---|
@@ -151,14 +167,11 @@ Per-category breakdown:
 | temporal-reasoning (127) | 97.6% | 88.2% | +9.4pp |
 | knowledge-update (72) | 98.6% | 94.4% | +4.2pp |
 
-Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness.
+Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness. The blended score (500 questions) enables fair comparison with competitors who include abstention in their aggregates.
 
-Two backends are supported:
+### Cost
 
-- **`openai` with a gpt-4o generator + gpt-4o judge** — the official, leaderboard-comparable setup (`evaluate_qa.py`, `o200k_base`, temperature 0). Substituting a different judge makes numbers non-comparable, a known problem with some published scores. The generator dominates the score and must be stated prominently.
-- **`anthropic` (Claude generator/judge)** — **not** leaderboard-comparable; an internal "Ghost retrieval + Claude generation, Claude-judged" check. Same-family generator+judge carries a self-preference caveat (the official gpt-4o-judges-gpt-4o setup has the same property); a different strong judge (e.g. gen `claude-sonnet-5`, judge `claude-opus-4-8`) costs only a few dollars more since the judge emits ~10 tokens/question.
-
-Estimated cost at `topk_context=5` over the full 470 answerable questions: ~$20 (gpt-4o gen+judge) or ~$24 (claude-sonnet-5 gen+judge); Opus as *generator* is ~$116 and should be avoided. Use `cost_estimate.py` (no API calls) to re-anchor before spending. Temperature 0, single recorded run, per-case results JSON and full logs committed, an explicit note that the memory system never saw oracle context.
+Estimated cost at `topk_context=5` over 500 questions: ~$3-5 (DeepSeek V4 Pro via OpenCode Go), ~$20 (gpt-4o gen+judge), ~$24 (claude-sonnet-5 gen+judge). Use `cost_estimate.py` (no API calls) to re-anchor before spending. Temperature 0, single recorded run, per-case results JSON and full logs committed, an explicit note that the memory system never saw oracle context.
 
 Reference points, all judged with the official GPT-4o harness but with **different generators** (which dominate the score — compare within-generator only): Zep 71.2% and full-context 60.2% (GPT-4o generator); Mastra 94.87% (gpt-5-mini generator; 84.23% with GPT-4o); agentmemory 96.2% (Claude Opus 4.6 generator, temperature 0).
 

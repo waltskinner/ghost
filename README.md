@@ -328,12 +328,12 @@ hybrid+graph     0.500   0.964   1.000    0.780    0.824
 - **We ran the ablations, found our own regression, and fixed it.** The graph-expansion ranking bonus *hurt* retrieval (`hybrid+graph`), so it ships disabled — the table keeps measuring it so a redesign has a bar to clear. `ghost bench --sweep` grid-searches the fusion parameters if you want to check our tuning.
 - **The staleness suite** ("prod ran Postgres 14, we migrated to 16" — does search rank the fresh fact first?) runs report-only in CI. At the shipped default, fresh facts are always retrieved but outrank their superseded versions only 8% of the time — a failure no memory system we know of even measures. An off-by-default recency prior flips it to 100% in the sweep — but a *recency-trap* fixture (older memory is the correct answer) proved a global prior can't be the default: it's a cliff, every weight that fixes staleness destroys old-but-still-correct retrieval. The targeted fix does clear it: directed `supersedes` links, consumed by a demote that fires only when a memory's actual replacement co-occurs — flipping staleness to **100% while leaving the trap at 0.929, untouched** (the free lunch the global prior couldn't be), because it only ever acts on genuine replacement pairs. Both halves now ship: `ghost supersede` creates the links (cosine proposes, Haiku confirms — 8/8 on a labeled genuine-vs-parallel set), and `SearchParams.SupersedeDemote` consumes them. Both are opt-in today; wiring the consumer into default search is the last, deliberately-gated step (it changes live ranking). Publishing the negative result, the reason, *and* the fix that survives it is the point.
 
-**End-to-end LongMemEval-S** (retrieve → generate → judge — DeepSeek v4 Pro as both generator and judge, 470 questions, `topk_context=5`):
+**End-to-end LongMemEval-S** (retrieve → generate → judge — DeepSeek v4 Pro as both generator and judge, **500 questions** including 30 abstention, `topk_context=5`):
 
 ```text
-condition   accuracy
-hybrid      96.8% (455/470)
-fts-only    83.6% (393/470)
+condition   blended(500)  non-abstention(470)  abstention(30)
+hybrid      96.2%         96.8%                86.7%
+fts-only    83.4%         83.6%                80.0%
 ```
 
 Per-category, hybrid vs FTS-only (the delta shows where vector search earns its keep):
@@ -347,7 +347,7 @@ Per-category, hybrid vs FTS-only (the delta shows where vector search earns its 
 | temporal-reasoning (127) | 97.6% | 88.2% | +9.4pp |
 | knowledge-update (72) | 98.6% | 94.4% | +4.2pp |
 
-The biggest lifts land on vocabulary-mismatch classes — `single-session-assistant` (+30pp) and `multi-session` (+20pp) — exactly where embeddings fix what FTS misses. Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness. Reproduce: see [`bench/longmemeval/phase4/`](bench/longmemeval/phase4/).
+The biggest lifts land on vocabulary-mismatch classes — `single-session-assistant` (+30pp) and `multi-session` (+20pp) — exactly where embeddings fix what FTS misses. The blended score (500 questions) includes abstention for fair comparison with competitors. Not leaderboard-comparable (DeepSeek v4 Pro, not GPT-4o), but the retrieval → answer pipeline is identical to the official harness. Reproduce: see [`bench/longmemeval/phase4/`](bench/longmemeval/phase4/).
 
 Skipped deliberately: LOCOMO (publicly audited answer-key and judge problems) and DMR.
 
