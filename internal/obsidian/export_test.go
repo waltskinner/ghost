@@ -279,6 +279,112 @@ func TestExportReclaimsOrphanedTmpFiles(t *testing.T) {
 	}
 }
 
+func TestExportPrunesDeletedProjectFolder(t *testing.T) {
+	store := seedStore(t)
+	ctx := context.Background()
+	if err := store.EnsureProject(ctx, "doomed", "/tmp/doomed", "doomed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, "ghost", memory.Memory{Category: "fact", Content: "Ghost fact", Importance: 0.8, Source: "mcp"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, "doomed", memory.Memory{Category: "fact", Content: "Doomed fact", Importance: 0.8, Source: "mcp"}); err != nil {
+		t.Fatal(err)
+	}
+
+	vault := filepath.Join(t.TempDir(), "vault")
+	ex := &Exporter{Store: store, Logger: slog.Default()}
+	if err := ex.Export(ctx, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Both project folders exist after initial export.
+	for _, proj := range []string{"ghost", "doomed"} {
+		notes, _ := filepath.Glob(filepath.Join(vault, proj, "Memories", "*.md"))
+		if len(notes) != 1 {
+			t.Fatalf("want 1 note in %s, got %d", proj, len(notes))
+		}
+	}
+
+	// Delete the doomed project from the DB.
+	if _, err := store.DeleteProject(ctx, "doomed", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-export — orphan folder should be pruned.
+	if err := ex.Export(ctx, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(vault, "doomed")); !os.IsNotExist(err) {
+		t.Error("deleted project's vault folder should be removed")
+	}
+	ghostNotes, _ := filepath.Glob(filepath.Join(vault, "ghost", "Memories", "*.md"))
+	if len(ghostNotes) != 1 {
+		t.Errorf("surviving project should be untouched, got %d notes", len(ghostNotes))
+	}
+}
+
+func TestExportSkipsOrphanCleanupWhenFiltered(t *testing.T) {
+	store := seedStore(t)
+	ctx := context.Background()
+	if err := store.EnsureProject(ctx, "other", "/tmp/other", "other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, "ghost", memory.Memory{Category: "fact", Content: "Ghost fact", Importance: 0.8, Source: "mcp"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, "other", memory.Memory{Category: "fact", Content: "Other fact", Importance: 0.8, Source: "mcp"}); err != nil {
+		t.Fatal(err)
+	}
+
+	vault := filepath.Join(t.TempDir(), "vault")
+	ex := &Exporter{Store: store, Logger: slog.Default()}
+	// Export unfiltered first to create both folders.
+	if err := ex.Export(ctx, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now export with filter — orphan cleanup should be skipped.
+	if err := ex.Export(ctx, vault, "ghost"); err != nil {
+		t.Fatal(err)
+	}
+	// The "other" folder must survive even though it's not in the filtered set.
+	notes, _ := filepath.Glob(filepath.Join(vault, "other", "Memories", "*.md"))
+	if len(notes) != 1 {
+		t.Errorf("filtered export must not prune other project's folder, got %d notes", len(notes))
+	}
+}
+
+func TestExportIgnoresUserFolders(t *testing.T) {
+	store := seedStore(t)
+	ctx := context.Background()
+	if _, err := store.Create(ctx, "ghost", memory.Memory{Category: "fact", Content: "Ghost fact", Importance: 0.8, Source: "mcp"}); err != nil {
+		t.Fatal(err)
+	}
+
+	vault := filepath.Join(t.TempDir(), "vault")
+	ex := &Exporter{Store: store, Logger: slog.Default()}
+	if err := ex.Export(ctx, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a user folder with non-Ghost .md files (no ghost_id frontmatter).
+	userDir := filepath.Join(vault, "my-notes")
+	if err := os.MkdirAll(userDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userDir, "jotting.md"), []byte("# My Note\nJust a note."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-export — user folder must survive.
+	if err := ex.Export(ctx, vault, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(userDir); os.IsNotExist(err) {
+		t.Error("user-created folder should not be pruned")
+	}
+}
+
 func TestTruncated(t *testing.T) {
 	for _, tc := range []struct {
 		n, limit int

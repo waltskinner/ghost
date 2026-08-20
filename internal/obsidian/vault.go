@@ -84,6 +84,26 @@ func hasGhostID(path string) (string, bool) {
 	return "", false
 }
 
+// hasGhostContent reports whether dir contains any .md file with a ghost_id
+// in its frontmatter — the signature of a Ghost-managed note.
+func hasGhostContent(dir string) bool {
+	var found bool
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		if _, ok := hasGhostID(path); ok {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return false // can't scan — preserve the folder
+	}
+	return found
+}
+
 // prune deletes Ghost-managed .md files under the given vault subtrees whose
 // ghost_id is not in keep, or whose basename is not the canonical one for
 // that ghost_id (a content edit renamed the slug — the old-slug file is
@@ -91,7 +111,7 @@ func hasGhostID(path string) (string, bool) {
 // are enforced. Orphaned *.ghost-tmp files (left by a crashed writeIfChanged)
 // are also reclaimed — but only inside the managed subtrees, behind the
 // marker guard.
-func prune(root string, subtrees []string, keep map[string]string) error {
+func prune(root string, subtrees []string, keep map[string]string, knownFolders []string) error {
 	if _, err := os.Stat(filepath.Join(root, markerName)); err != nil {
 		return fmt.Errorf("refusing to prune: %s marker not found in %s", markerName, root)
 	}
@@ -125,6 +145,37 @@ func prune(root string, subtrees []string, keep map[string]string) error {
 		})
 		if err != nil {
 			return err
+		}
+	}
+	// Orphan cleanup: remove vault top-level directories that are not in the
+	// current project set but contain Ghost-managed content. This handles
+	// projects deleted from the DB since the last export. Skipped when
+	// knownFolders is nil (filtered export — we can't know what's orphaned).
+	if len(knownFolders) > 0 {
+		known := make(map[string]bool, len(knownFolders))
+		for _, f := range knownFolders {
+			known[f] = true
+		}
+		entries, err := readDir(root)
+		if err != nil {
+			return fmt.Errorf("read vault root for orphan scan: %w", err)
+		}
+		for _, e := range entries {
+			if !e.IsDir() || e.Name() == markerName {
+				continue
+			}
+			if known[e.Name()] {
+				continue
+			}
+			if !filepath.IsLocal(e.Name()) {
+				return fmt.Errorf("refusing to prune: orphan dir %q escapes vault root", e.Name())
+			}
+			dir := filepath.Join(root, e.Name())
+			if hasGhostContent(dir) {
+				if err := os.RemoveAll(dir); err != nil {
+					return fmt.Errorf("remove orphan folder %s: %w", e.Name(), err)
+				}
+			}
 		}
 	}
 	return nil

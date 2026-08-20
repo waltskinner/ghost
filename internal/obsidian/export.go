@@ -151,7 +151,16 @@ func (e *Exporter) Export(ctx context.Context, vaultDir, projectFilter string) e
 			subtrees = append(subtrees, d.folder)
 		}
 	}
-	if err := prune(vaultDir, subtrees, keep); err != nil {
+	// Build the full set of known project folders (including truncated
+	// projects) so prune can distinguish deleted projects from active ones.
+	var knownFolders []string
+	if projectFilter == "" {
+		knownFolders = make([]string, 0, len(folders))
+		for _, f := range folders {
+			knownFolders = append(knownFolders, f)
+		}
+	}
+	if err := prune(vaultDir, subtrees, keep, knownFolders); err != nil {
 		return err
 	}
 	e.Logger.Info("obsidian export complete", "projects", len(data), "written", written, "unchanged", skipped)
