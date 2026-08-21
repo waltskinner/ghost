@@ -85,7 +85,7 @@ staleness fixture. Multiplying before truncation therefore lets decay override
 relevance — the top-10 becomes "the 10 youngest matching memories", and a
 rank-1 relevant fresh answer is displaced by unrelated younger clutter (3/48
 staleness probes lost their fresh version). Truncate-first keeps fresh-found at
-1.000 while still flipping fresh-wins from 0.083 → 0.938.
+1.000 while still flipping fresh-wins from 0.083 → 1.000.
 
 Pipeline consequence: `fuseAndRank` currently hydrates (`GetByIDs`) only the
 already-truncated `limit` window. The decay reorder still needs each

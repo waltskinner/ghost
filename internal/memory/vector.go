@@ -273,11 +273,13 @@ func decayFactor(category string, pinned bool, ageDays float64) float64 {
 // FTS-only paths), base = 1/(RRFK+rank+1). Membership is owned by base score
 // alone — decay reorders but never drops a more-relevant memory, which is what
 // keeps findability intact (a rank-1 relevant fresh answer is never displaced
-// by unrelated younger memories). The sort by base happens in both modes — the
-// fused path hydrates via GetByIDs, which does NOT preserve order. Age reads
-// created_at — never updated_at, which Upsert's strengthen path bumps. An
-// unparseable created_at is treated as ancient so a malformed timestamp can
-// never spuriously win.
+// by unrelated younger memories). The tradeoff, accepted by design: a fresh
+// memory ranked below the cut by base score is NOT rescued — decay only lifts
+// fresh versions that are already inside the window. The sort by base happens
+// in both modes — the fused path hydrates via GetByIDs, which does NOT
+// preserve order. Age reads created_at — never updated_at, which Upsert's
+// strengthen path bumps. An unparseable created_at is treated as ancient so a
+// malformed timestamp can never spuriously win.
 func decayRank(results []Memory, scores map[string]float64, p SearchParams, limit int, now time.Time) []Memory {
 	scored := make([]struct {
 		m    Memory
